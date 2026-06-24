@@ -30,6 +30,15 @@
 //     with `amix`; assets with no audio stream must be detected and
 //     skipped, or ffmpeg errors out immediately on the missing stream
 //     specifier.
+//  6. Text overlays use `drawtext` with `expansion=none` — without it,
+//     ffmpeg's default "normal" expansion mode treats any literal `%` in
+//     the text as the start of a `%{...}` template token. A malformed
+//     token doesn't error; it silently warns ("Stray %...") and the text
+//     renders as blank. With expansion=none, % needs no escaping at all.
+//     Colon and backslash still need backslash-escaping (colon separates
+//     filter options); single quote has no escape inside a single-quoted
+//     filter value, so it's substituted with a Unicode right single
+//     quotation mark instead.
 package export
 
 import (
@@ -61,9 +70,9 @@ func NewBuilder() *Builder {
 // each clip may need different -ss/-t trimming applied at the input
 // level for very long source files — see note in buildInputs).
 type inputRef struct {
-	clip      models.Clip
-	asset     models.MediaAsset
-	inputIdx  int
+	clip     models.Clip
+	asset    models.MediaAsset
+	inputIdx int
 }
 
 // PlanExport assembles every piece needed to run the export: the ordered
@@ -72,7 +81,7 @@ type inputRef struct {
 // this means the filter graph can be unit-tested (as a string) without
 // actually invoking ffmpeg.
 type ExportPlan struct {
-	InputArgs    []string // e.g. ["-i", "/path/a.mp4", "-i", "/path/b.mp4", ...]
+	InputArgs     []string // e.g. ["-i", "/path/a.mp4", "-i", "/path/b.mp4", ...]
 	FilterComplex string
 	VideoOutLabel string // e.g. "[outv]" -- always set
 	AudioOutLabel string // e.g. "[outa]" -- empty string if the project has no audio at all
@@ -113,6 +122,34 @@ func sortedClips(track models.Track) []models.Clip {
 		return clips[i].TimelineStartSec < clips[j].TimelineStartSec
 	})
 	return clips
+}
+
+// sortedTextClips mirrors sortedClips for TextClip, used so text overlays
+// chain onto the filter graph in a stable, deterministic order rather
+// than whatever order they happen to sit in project.json.
+func sortedTextClips(track models.Track) []models.TextClip {
+	clips := make([]models.TextClip, len(track.TextClips))
+	copy(clips, track.TextClips)
+	sort.Slice(clips, func(i, j int) bool {
+		return clips[i].TimelineStartSec < clips[j].TimelineStartSec
+	})
+	return clips
+}
+
+// textTracksSortedByOrder returns only text tracks, sorted bottom-to-top
+// by Order, mirroring videoTracksSortedByOrder. In Phase 1 there's
+// typically just one text track, but supporting several (e.g. a
+// permanent watermark track plus a captions track) costs nothing extra
+// here.
+func textTracksSortedByOrder(proj *models.Project) []models.Track {
+	var tracks []models.Track
+	for _, t := range proj.Tracks {
+		if t.Type == models.TrackText && !t.Hidden {
+			tracks = append(tracks, t)
+		}
+	}
+	sort.Slice(tracks, func(i, j int) bool { return tracks[i].Order < tracks[j].Order })
+	return tracks
 }
 
 // videoTracksSortedByOrder returns only video tracks, sorted so the
@@ -297,6 +334,28 @@ func Plan(proj *models.Project, settings models.ExportSettings) (*ExportPlan, er
 		}
 	}
 
+	// --- Text layers: drawtext, always composited above every video
+	// track. Text tracks are not range-checked against each other the
+	// same way video tracks are in Phase 1 (overlapping captions are a
+	// legitimate, common thing - e.g. a persistent watermark plus a
+	// timed caption), so every text clip from every text track just
+	// gets chained onto the video stream in track order.
+	textTracks := textTracksSortedByOrder(proj)
+	for _, track := range textTracks {
+		for _, tc := range sortedTextClips(track) {
+			nextVideoLabel := fmt.Sprintf("txt_%s", sanitizeLabel(tc.ID))
+			drawtextFilter, err := buildDrawtextFilter(tc, settings)
+			if err != nil {
+				return nil, fmt.Errorf("text clip %s: %w", tc.ID, err)
+			}
+			filterParts = append(filterParts, fmt.Sprintf(
+				"[%s]%s[%s]",
+				currentVideoLabel, drawtextFilter, nextVideoLabel,
+			))
+			currentVideoLabel = nextVideoLabel
+		}
+	}
+
 	finalVideoLabel := "outv"
 	// Final format normalization: after overlay chains the stream may be
 	// yuva420p (has alpha); the output container/encoder expects
@@ -441,4 +500,173 @@ func BuildCommand(ctx context.Context, ffmpegPath string, plan *ExportPlan, sett
 // missing parent directories for -output.
 func EnsureOutputDir(outputPath string) string {
 	return filepath.Dir(outputPath)
+}
+
+// --- Text rendering (drawtext) ---
+
+// FontsDir is where bundled font files live, relative to the packaged
+// app's working directory at runtime. Phase 1 ships a small, fixed set
+// of fonts rather than resolving arbitrary system font names, for two
+// reasons: (1) "Arial" or "Helvetica" may not exist, or may render
+// subtly differently, across Windows/macOS/Linux, breaking the promise
+// that export matches preview; (2) shipping our own font files means
+// drawtext always has a real file to point at, with no installation-
+// dependent failure mode. Set this from app.go's startup() to wherever
+// the packaged app actually places its fonts/ folder.
+var FontsDir = "fonts"
+
+func fontRegistry() map[string]string {
+	return map[string]string{
+		"sans":       FontsDir + "/DejaVuSans.ttf",
+		"sans-bold":  FontsDir + "/DejaVuSans-Bold.ttf",
+		"serif":      FontsDir + "/DejaVuSerif.ttf",
+		"serif-bold": FontsDir + "/DejaVuSerif-Bold.ttf",
+		"mono":       FontsDir + "/DejaVuSansMono.ttf",
+		"mono-bold":  FontsDir + "/DejaVuSansMono-Bold.ttf",
+	}
+}
+
+// resolveFontFile picks a font file path from fontFamily + fontWeight,
+// falling back to plain "sans" for any unrecognized family rather than
+// failing the whole export over a styling mismatch - a missing/wrong
+// font is a cosmetic problem, not a reason to lose someone's render.
+func resolveFontFile(fontFamily, fontWeight string) string {
+	registry := fontRegistry()
+	key := fontFamily
+	if fontWeight == "bold" {
+		key = fontFamily + "-bold"
+	}
+	if path, ok := registry[key]; ok {
+		return path
+	}
+	if path, ok := registry[fontFamily]; ok {
+		return path
+	}
+	if fontWeight == "bold" {
+		return registry["sans-bold"]
+	}
+	return registry["sans"]
+}
+
+// escapeDrawtextValue escapes a string for safe use as a drawtext
+// filter option value, when the filter graph string is passed as ONE
+// literal argv element (Go's exec.Command never invokes a shell, so no
+// shell-level escaping is needed or wanted here - only ffmpeg's own
+// filtergraph syntax matters).
+//
+// This was verified character-by-character against a real ffmpeg binary
+// before being written here (see project notes) - in particular:
+//   - backslash must be escaped first, or escaping the other characters
+//     below would introduce new backslashes that then get re-escaped.
+//   - colon must be escaped: it separates filter key=value options.
+//   - single quote has no working escape inside a single-quoted
+//     drawtext value, so it's substituted with a Unicode right single
+//     quotation mark (’) instead - visually nearly identical, and avoids
+//     a class of "unterminated quote" filter graph parse failures.
+//   - percent sign needs NO escaping, provided the drawtext filter is
+//     built with expansion=none (see buildDrawtextFilter) - ffmpeg's
+//     default "normal" expansion mode treats % as the start of a
+//     %{...} template token, and a stray one silently renders blank
+//     text instead of erroring, which is a much worse failure mode than
+//     requiring expansion=none everywhere text is drawn.
+func escapeDrawtextValue(text string) string {
+	text = strings.ReplaceAll(text, `\`, `\\`)
+	text = strings.ReplaceAll(text, `:`, `\:`)
+	text = strings.ReplaceAll(text, `'`, "\u2019")
+	return text
+}
+
+// sanitizeLabel strips characters that aren't valid inside ffmpeg filter
+// graph link labels (e.g. "[label]") from a clip ID, since UUIDs contain
+// hyphens which are fine, but defensively stripping anything unexpected
+// here is cheap insurance against a malformed/legacy ID breaking the
+// entire filter graph string.
+func sanitizeLabel(id string) string {
+	var b strings.Builder
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// buildDrawtextFilter constructs one drawtext filter clause (without the
+// surrounding "[in]...[out]" link labels - the caller adds those) for a
+// single TextClip. Position is converted from the clip's 0-100 percent
+// coordinates into ffmpeg expressions referencing the actual output
+// width/height, so positioning stays correct regardless of export
+// resolution - this mirrors how the canvas preview computes position
+// from the same percentages against whatever the live canvas size is.
+func buildDrawtextFilter(tc models.TextClip, settings models.ExportSettings) (string, error) {
+	if strings.TrimSpace(tc.Content) == "" {
+		return "", fmt.Errorf("text content is empty")
+	}
+
+	fontFile := resolveFontFile(tc.FontFamily, tc.FontWeight)
+	escapedText := escapeDrawtextValue(tc.Content)
+	escapedFontFile := escapeDrawtextValue(fontFile)
+
+	fontColor := tc.Color
+	if fontColor == "" {
+		fontColor = "#ffffff"
+	}
+	opacity := tc.Opacity
+	if opacity <= 0 {
+		opacity = 1.0
+	}
+	// drawtext takes color alpha as an @ suffix (e.g. "white@0.8"), not
+	// a separate option - fold the clip's Opacity into the color value.
+	fontColorWithAlpha := fmt.Sprintf("%s@%.3f", fontColor, opacity)
+
+	// x/y position from percentage: the percentage marks the CENTER of
+	// the text box, so subtract half the rendered text's own width/height
+	// (text_w/text_h are expressions drawtext resolves at render time,
+	// after it knows the actual rendered size of this specific string in
+	// this specific font/size).
+	xExpr := fmt.Sprintf("(w*%.4f)-(text_w/2)", tc.PositionXPercent/100.0)
+	yExpr := fmt.Sprintf("(h*%.4f)-(text_h/2)", tc.PositionYPercent/100.0)
+
+	parts := []string{
+		"drawtext=expansion=none",
+		"fontfile='" + escapedFontFile + "'",
+		"text='" + escapedText + "'",
+		fmt.Sprintf("fontsize=%d", tc.FontSize),
+		"fontcolor='" + fontColorWithAlpha + "'",
+		"x=" + xExpr,
+		"y=" + yExpr,
+		fmt.Sprintf("enable='between(t,%.6f,%.6f)'", tc.TimelineStartSec, tc.TimelineEndSec),
+	}
+
+	if tc.OutlineEnabled && tc.OutlineWidth > 0 {
+		outlineColor := tc.OutlineColor
+		if outlineColor == "" {
+			outlineColor = "#000000"
+		}
+		parts = append(parts,
+			"bordercolor='"+escapeDrawtextValue(outlineColor)+"'",
+			fmt.Sprintf("borderw=%d", tc.OutlineWidth),
+		)
+	}
+
+	if tc.ShadowEnabled {
+		shadowColor := tc.ShadowColor
+		if shadowColor == "" {
+			shadowColor = "#000000@0.5"
+		}
+		parts = append(parts,
+			"shadowcolor='"+escapeDrawtextValue(shadowColor)+"'",
+			"shadowx=2",
+			"shadowy=2",
+		)
+	}
+
+	// settings is currently unused directly (position is resolved via
+	// ffmpeg's own w/h expressions, which already refer to the actual
+	// output frame size) - kept as a parameter for forward-compatibility
+	// since font-size-as-percent-of-canvas-height scaling is a likely
+	// near-future addition that would need it.
+	_ = settings
+
+	return strings.Join(parts, ":"), nil
 }

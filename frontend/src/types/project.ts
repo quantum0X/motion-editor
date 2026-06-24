@@ -4,7 +4,28 @@
 // shape as it arrives in the frontend.
 
 export type MediaType = "video" | "audio" | "image";
-export type TrackType = "video" | "audio";
+export type TrackType = "video" | "audio" | "text";
+
+export interface TextClip {
+  id: string;
+  trackId: string;
+  timelineStartSec: number;
+  timelineEndSec: number;
+  content: string;
+  fontFamily: string; // "sans" | "serif" | "mono" - keys into the backend's bundled font registry
+  fontSize: number;
+  fontWeight: "normal" | "bold";
+  color: string; // hex, e.g. "#ffffff"
+  positionXPercent: number; // 0-100, horizontal center of the text box
+  positionYPercent: number; // 0-100, vertical center of the text box
+  alignment: "left" | "center" | "right";
+  outlineEnabled: boolean;
+  outlineColor: string;
+  outlineWidth: number;
+  shadowEnabled: boolean;
+  shadowColor: string;
+  opacity: number;
+}
 
 export interface MediaAsset {
   id: string;
@@ -45,6 +66,7 @@ export interface Track {
   hidden: boolean;
   muted: boolean;
   clips: Clip[];
+  textClips: TextClip[];
 }
 
 export interface Project {

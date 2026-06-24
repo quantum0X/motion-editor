@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from "uuid";
 import type { EditorBackend } from "./EditorBackend";
-import type { Project, Clip, Track, MediaAsset, ExportProgress } from "../types/project";
+import type { Project, Clip, TextClip, Track, MediaAsset, ExportProgress } from "../types/project";
 
 /**
  * In-browser mock of the Go backend. Mirrors the validation/mutation
@@ -25,9 +25,9 @@ function makeEmptyProject(name: string, w = 1920, h = 1080, fps = 30): Project {
     canvasHeight: h,
     fps,
     tracks: [
-      { id: uuidv4(), type: "video", name: "Video 2", order: 1, locked: false, hidden: false, muted: false, clips: [] },
-      { id: uuidv4(), type: "video", name: "Video 1", order: 0, locked: false, hidden: false, muted: false, clips: [] },
-      { id: uuidv4(), type: "audio", name: "Audio 1", order: 0, locked: false, hidden: false, muted: false, clips: [] },
+      { id: uuidv4(), type: "video", name: "Video 2", order: 1, locked: false, hidden: false, muted: false, clips: [], textClips: [] },
+      { id: uuidv4(), type: "video", name: "Video 1", order: 0, locked: false, hidden: false, muted: false, clips: [], textClips: [] },
+      { id: uuidv4(), type: "audio", name: "Audio 1", order: 0, locked: false, hidden: false, muted: false, clips: [], textClips: [] },
     ],
     assets: [],
   };
@@ -40,6 +40,14 @@ export function createMockBackend(): EditorBackend {
   function findClip(clipId: string): { clip: Clip; track: Track } | null {
     for (const track of project.tracks) {
       const clip = track.clips.find((c) => c.id === clipId);
+      if (clip) return { clip, track };
+    }
+    return null;
+  }
+
+  function findTextClip(clipId: string): { clip: TextClip; track: Track } | null {
+    for (const track of project.tracks) {
+      const clip = track.textClips.find((c) => c.id === clipId);
       if (clip) return { clip, track };
     }
     return null;
@@ -208,6 +216,86 @@ export function createMockBackend(): EditorBackend {
 
       track.clips.push(copy);
       return { project: structuredClone(project), newClipId: copy.id };
+    },
+
+    async addTextTrack(name) {
+      const textTrackCount = project.tracks.filter((t) => t.type === "text").length;
+      const maxOrder = Math.max(-1, ...project.tracks.filter((t) => t.type === "text").map((t) => t.order));
+      project.tracks.push({
+        id: uuidv4(),
+        type: "text",
+        name: name || `Text ${textTrackCount + 1}`,
+        order: maxOrder + 1,
+        locked: false,
+        hidden: false,
+        muted: false,
+        clips: [],
+        textClips: [],
+      });
+      return structuredClone(project);
+    },
+
+    async addTextClip(trackId, clipInput) {
+      const track = project.tracks.find((t) => t.id === trackId);
+      if (!track) throw new Error(`Track ${trackId} not found`);
+      if (track.type !== "text") throw new Error(`Track ${trackId} is not a text track`);
+      if (!clipInput.content || !clipInput.content.trim()) throw new Error("Text content cannot be empty");
+      if (clipInput.timelineEndSec <= clipInput.timelineStartSec) throw new Error("Text clip must have a positive duration");
+
+      const newClip: TextClip = {
+        id: clipInput.id || uuidv4(),
+        trackId,
+        timelineStartSec: clipInput.timelineStartSec,
+        timelineEndSec: clipInput.timelineEndSec,
+        content: clipInput.content,
+        fontFamily: clipInput.fontFamily || "sans",
+        fontSize: clipInput.fontSize || 32,
+        fontWeight: clipInput.fontWeight || "bold",
+        color: clipInput.color || "#ffffff",
+        positionXPercent: clipInput.positionXPercent ?? 50,
+        positionYPercent: clipInput.positionYPercent ?? 85,
+        alignment: clipInput.alignment || "center",
+        outlineEnabled: clipInput.outlineEnabled ?? false,
+        outlineColor: clipInput.outlineColor || "#000000",
+        outlineWidth: clipInput.outlineWidth ?? 2,
+        shadowEnabled: clipInput.shadowEnabled ?? false,
+        shadowColor: clipInput.shadowColor || "#000000",
+        opacity: clipInput.opacity ?? 1,
+      };
+
+      track.textClips.push(newClip);
+      return structuredClone(project);
+    },
+
+    async updateTextClip(clipId, updated) {
+      const found = findTextClip(clipId);
+      if (!found) throw new Error(`Text clip ${clipId} not found`);
+      if (!updated.content || !updated.content.trim()) throw new Error("Text content cannot be empty");
+      if (updated.timelineEndSec <= updated.timelineStartSec) throw new Error("Text clip must have a positive duration");
+
+      const { track } = found;
+      const idx = track.textClips.findIndex((c) => c.id === clipId);
+      track.textClips[idx] = { ...updated, id: clipId, trackId: track.id };
+      return structuredClone(project);
+    },
+
+    async deleteTextClip(clipId) {
+      for (const track of project.tracks) {
+        const before = track.textClips.length;
+        track.textClips = track.textClips.filter((c) => c.id !== clipId);
+        if (track.textClips.length !== before) return structuredClone(project);
+      }
+      throw new Error(`Text clip ${clipId} not found`);
+    },
+
+    async moveTextClip(clipId, newStartSec) {
+      const found = findTextClip(clipId);
+      if (!found) throw new Error(`Text clip ${clipId} not found`);
+      const { clip } = found;
+      const duration = clip.timelineEndSec - clip.timelineStartSec;
+      clip.timelineStartSec = newStartSec;
+      clip.timelineEndSec = newStartSec + duration;
+      return structuredClone(project);
     },
 
     async openFileDialog() {

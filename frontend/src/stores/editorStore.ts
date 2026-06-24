@@ -1,10 +1,11 @@
 import { create } from "zustand";
-import type { Project, Clip } from "../types/project";
+import type { Project, Clip, TextClip } from "../types/project";
 import { createBackend } from "../services";
 
 interface EditorState {
   project: Project | null;
   selectedClipId: string | null;
+  selectedTextClipId: string | null;
   playheadSec: number;
   isPlaying: boolean;
   pixelsPerSecond: number; // timeline zoom level
@@ -14,6 +15,7 @@ interface EditorState {
   // derived-ish setters
   setProject: (p: Project) => void;
   selectClip: (clipId: string | null) => void;
+  selectTextClip: (clipId: string | null) => void;
   setPlayhead: (sec: number) => void;
   setIsPlaying: (playing: boolean) => void;
   setZoom: (pixelsPerSecond: number) => void;
@@ -29,6 +31,13 @@ interface EditorState {
   deleteSelectedClip: () => Promise<void>;
   duplicateSelectedClip: () => Promise<void>;
   saveProject: () => Promise<void>;
+
+  // text clip actions
+  ensureTextTrack: () => Promise<string>; // returns the text track ID, creating one if none exists
+  addTextClip: (trackId: string, clip: Omit<TextClip, "id" | "trackId">) => Promise<void>;
+  updateTextClip: (clipId: string, updated: TextClip) => Promise<void>;
+  deleteSelectedTextClip: () => Promise<void>;
+  moveTextClip: (clipId: string, newStartSec: number) => Promise<void>;
 }
 
 /**
@@ -53,6 +62,7 @@ export function timelineDurationSec(project: Project | null): number {
 export const useEditorStore = create<EditorState>((set, get) => ({
   project: null,
   selectedClipId: null,
+  selectedTextClipId: null,
   playheadSec: 0,
   isPlaying: false,
   pixelsPerSecond: 60,
@@ -60,7 +70,8 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   lastError: null,
 
   setProject: (p) => set({ project: p }),
-  selectClip: (clipId) => set({ selectedClipId: clipId }),
+  selectClip: (clipId) => set({ selectedClipId: clipId, selectedTextClipId: clipId ? null : get().selectedTextClipId }),
+  selectTextClip: (clipId) => set({ selectedTextClipId: clipId, selectedClipId: clipId ? null : get().selectedClipId }),
   setPlayhead: (sec) => set({ playheadSec: Math.max(0, sec) }),
   setIsPlaying: (playing) => set({ isPlaying: playing }),
   setZoom: (pixelsPerSecond) => set({ pixelsPerSecond: Math.min(800, Math.max(5, pixelsPerSecond)) }),
@@ -166,6 +177,71 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     try {
       const backend = await createBackend();
       const project = await backend.saveProject();
+      set({ project });
+    } catch (e: any) {
+      set({ lastError: e.message || String(e) });
+    }
+  },
+
+  ensureTextTrack: async () => {
+    const { project } = get();
+    const existing = project?.tracks.find((t) => t.type === "text");
+    if (existing) return existing.id;
+
+    set({ lastError: null });
+    try {
+      const backend = await createBackend();
+      const updatedProject = await backend.addTextTrack("Text 1");
+      set({ project: updatedProject });
+      const newTrack = updatedProject.tracks.find((t) => t.type === "text");
+      if (!newTrack) throw new Error("Text track was not created");
+      return newTrack.id;
+    } catch (e: any) {
+      set({ lastError: e.message || String(e) });
+      throw e;
+    }
+  },
+
+  addTextClip: async (trackId, clip) => {
+    set({ lastError: null });
+    try {
+      const backend = await createBackend();
+      const project = await backend.addTextClip(trackId, { ...clip, trackId });
+      set({ project });
+    } catch (e: any) {
+      set({ lastError: e.message || String(e) });
+    }
+  },
+
+  updateTextClip: async (clipId, updated) => {
+    set({ lastError: null });
+    try {
+      const backend = await createBackend();
+      const project = await backend.updateTextClip(clipId, updated);
+      set({ project });
+    } catch (e: any) {
+      set({ lastError: e.message || String(e) });
+    }
+  },
+
+  deleteSelectedTextClip: async () => {
+    const { selectedTextClipId } = get();
+    if (!selectedTextClipId) return;
+    set({ lastError: null });
+    try {
+      const backend = await createBackend();
+      const project = await backend.deleteTextClip(selectedTextClipId);
+      set({ project, selectedTextClipId: null });
+    } catch (e: any) {
+      set({ lastError: e.message || String(e) });
+    }
+  },
+
+  moveTextClip: async (clipId, newStartSec) => {
+    set({ lastError: null });
+    try {
+      const backend = await createBackend();
+      const project = await backend.moveTextClip(clipId, newStartSec);
       set({ project });
     } catch (e: any) {
       set({ lastError: e.message || String(e) });

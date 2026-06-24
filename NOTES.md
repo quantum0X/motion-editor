@@ -87,7 +87,85 @@ no H.264 support (VP9/WebM works fine) — `DEMUXER_ERROR_NO_SUPPORTED_STREAMS`
 on .mp4 is expected here and is not an app bug. Real Chrome, the Wails
 webview, and your OS's native video stack all support H.264 normally.
 
-## Next steps, in order
+## Text layer (added in this session)
+
+**Status: complete and verified end-to-end, both backend export and live
+frontend preview.**
+
+Backend support for title/caption text clips is implemented and verified
+the same way the video export pipeline was: by actually running the
+generated FFmpeg command, not just reading the code.
+
+`backend/models/models.go` — added `TrackText` and the `TextClip` struct
+(content, font family/weight/size, color, position as 0-100% of canvas,
+outline, shadow, opacity, time range). Position is percentage-based so it
+stays correct regardless of project resolution.
+
+`backend/export/builder.go` — text clips render via FFmpeg's `drawtext`,
+always composited above every video track. Two real bugs were found and
+fixed by actually rendering output and checking it, not just reading the
+generated filter string:
+
+1. A literal `%` in text content makes `drawtext` silently render
+   **blank text** (a "Stray %" warning, not an error — exit code stays 0).
+   FFmpeg's default expansion mode treats `%` as the start of a
+   `%{...}` template token. Fixed with `expansion=none`, which disables
+   token parsing entirely, so percent signs need no escaping.
+2. `drawtext=expansion=none:fontfile=...` is correct; `drawtext:expansion=none:...`
+   (colon instead of `=` right after the filter name) is a filter-graph
+   **parse error** ffmpeg rejects outright. Caught by running the actual
+   Go-generated command through real ffmpeg, not just by reading the
+   generated string and assuming it looked plausible.
+
+`app.go` — added `AddTextTrack`, `AddTextClip`, `UpdateTextClip`,
+`DeleteTextClip`, `MoveTextClip` bindings, following the same
+validation/error patterns as the existing media-clip mutation methods.
+
+**Frontend — built and verified via real browser interaction
+(Playwright), not just typecheck:**
+- `features/player/useCompositor.ts`: canvas rendering for text clips
+  (`drawTextClip`), using Canvas 2D `fillText`/`strokeText`/native shadow
+  properties to approximate `drawtext`'s outline/shadow/positioning as
+  closely as Canvas 2D allows. Font family maps to a CSS stack
+  (sans/serif/mono) rather than loading the exact bundled .ttf for
+  preview — glyph shapes differ slightly between preview (browser font)
+  and export (bundled DejaVu), but position/size/timing decisions made
+  while editing are accurate, which is what actually matters live.
+- `features/timeline/TimelineTextClip.tsx`: drag-to-move, edge-drag to
+  resize duration, double-click to open the properties panel.
+- `features/timeline/TextClipPanel.tsx`: content textarea, font/size/
+  weight pickers, color picker (swatch + hex), position presets (Top/
+  Center/Lower Third), outline/shadow toggles — edits apply live to both
+  the timeline label and the canvas preview as you type.
+- `features/timeline/Timeline.tsx`: "Add Text" toolbar button (creates a
+  text track on first use, adds a 3-second clip at the playhead).
+- Verified live in a real Chromium browser: add → drag → double-click to
+  edit → change content/color/shadow → canvas updates immediately on
+  every change, confirmed via screenshots at each step.
+
+**Fonts**: ships its own bundled DejaVu Sans/Serif/Mono (regular + bold)
+rather than resolving system font names, since "Arial" may not exist or
+may render differently across Windows/macOS/Linux — this guarantees
+export always matches preview (closely - see the canvas-vs-drawtext
+glyph note above). Font files belong in a `fonts/` directory alongside
+the packaged app; `export.FontsDir` (default `"fonts"`) should be set
+from `app.go`'s `startup()` to wherever the packaged app actually places
+them. **This zip includes a populated `fonts/` directory** (DejaVu,
+public domain / Bitstream Vera license) so the export builder has
+something real to point at out of the box.
+
+**Known gaps, not yet done:**
+- Overlapping text clips on the *same* text track aren't rejected the
+  way overlapping media clips are (different tracks intentionally allow
+  overlap - e.g. watermark + caption - but same-track overlap probably
+  should be prevented or at least warned about; not addressed yet).
+- No "duplicate text clip" or copy/paste support yet (media clips have
+  this via Ctrl+D / Ctrl+C/V; text clips don't).
+- Canvas preview approximates but doesn't pixel-match drawtext's exact
+  glyph rendering (see font note above) - close enough for editing
+  decisions, not guaranteed identical to the final export pixel-for-pixel.
+
+
 1. `wails dev` (or install Wails CLI: `go install
    github.com/wailsapp/wails/v2/cmd/wails@latest`, then `wails doctor` to
    confirm your system has the right webview/GTK libraries — standard on

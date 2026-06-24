@@ -1,6 +1,7 @@
 import type {
   Project,
   Clip,
+  TextClip,
   ExportSettings,
   ExportProgress,
   RecentEntry,
@@ -40,6 +41,13 @@ export interface EditorBackend {
   splitClip(clipId: string, splitAtSec: number): Promise<Project>;
   deleteClip(clipId: string): Promise<Project>;
   duplicateClip(clipId: string): Promise<{ project: Project; newClipId: string }>;
+
+  // Text clips
+  addTextTrack(name: string): Promise<Project>;
+  addTextClip(trackId: string, clip: Partial<TextClip> & Pick<TextClip, "content" | "timelineStartSec" | "timelineEndSec">): Promise<Project>;
+  updateTextClip(clipId: string, updated: TextClip): Promise<Project>;
+  deleteTextClip(clipId: string): Promise<Project>;
+  moveTextClip(clipId: string, newStartSec: number): Promise<Project>;
 
   // Media import
   openFileDialog(): Promise<string[]>;

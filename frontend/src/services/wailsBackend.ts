@@ -1,5 +1,5 @@
 import type { EditorBackend } from "./EditorBackend";
-import type { Project, Clip, ExportSettings, ExportProgress } from "../types/project";
+import type { Project, Clip, TextClip, ExportSettings, ExportProgress } from "../types/project";
 
 // Wails injects a `window.go.main.App.<MethodName>` function for every
 // bound method on the Go App struct, plus `window.runtime.EventsOn` for
@@ -24,6 +24,11 @@ declare global {
           SplitClip(clipId: string, splitAt: number): Promise<Project>;
           DeleteClip(clipId: string): Promise<Project>;
           DuplicateClip(clipId: string): Promise<[Project, string]>;
+          AddTextTrack(name: string): Promise<Project>;
+          AddTextClip(trackId: string, clip: Partial<TextClip>): Promise<Project>;
+          UpdateTextClip(clipId: string, updated: TextClip): Promise<Project>;
+          DeleteTextClip(clipId: string): Promise<Project>;
+          MoveTextClip(clipId: string, newStart: number): Promise<Project>;
           OpenFileDialog(): Promise<string[]>;
           ImportMediaFiles(paths: string[]): Promise<[Project, any[]]>;
           StartExport(settings: ExportSettings): Promise<string>;
@@ -58,6 +63,12 @@ export function createWailsBackend(): EditorBackend {
       const [project, newClipId] = await api.DuplicateClip(clipId);
       return { project, newClipId };
     },
+
+    addTextTrack: (name) => api.AddTextTrack(name),
+    addTextClip: (trackId, clip) => api.AddTextClip(trackId, clip),
+    updateTextClip: (clipId, updated) => api.UpdateTextClip(clipId, updated),
+    deleteTextClip: (clipId) => api.DeleteTextClip(clipId),
+    moveTextClip: (clipId, newStartSec) => api.MoveTextClip(clipId, newStartSec),
 
     openFileDialog: () => api.OpenFileDialog(),
     importMediaFiles: async (paths) => {

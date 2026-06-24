@@ -26,3 +26,5 @@ frontend/wailsjs/
 *.mov
 *.avi
 *.mkv
+
+*.exe

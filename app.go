@@ -37,8 +37,8 @@ var assets embed.FS
 type App struct {
 	ctx context.Context
 
-	projectSvc *project.Service
-	mediaSvc   *media.Service
+	projectSvc    *project.Service
+	mediaSvc      *media.Service
 	exportBuilder *export.Builder
 
 	// exportMu guards exportCancel so only one export can run at a time
@@ -380,6 +380,194 @@ func removeClip(clips []models.Clip, id string) []models.Clip {
 		}
 	}
 	return out
+}
+
+// --- Text clip mutation ---
+//
+// Text clips are simpler than media clips: no asset reference, no
+// source-in/out trimming, and (in Phase 1) overlapping text clips on
+// different text tracks are allowed since stacked captions/watermarks
+// are a legitimate use case (see export/builder.go's comment on this).
+// They still get the same not-found/no-project error handling as the
+// other mutation methods for a consistent frontend error-handling story.
+
+// AddTextClip creates a new text clip on the given text track. Sensible
+// defaults are filled in for any zero-valued styling fields so the
+// frontend can send a minimal payload (e.g. just content + timing) for
+// a "quick add" flow and still get a clip that's visible and legible.
+func (a *App) AddTextClip(trackID string, tc models.TextClip) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+
+	if strings.TrimSpace(tc.Content) == "" {
+		return nil, fmt.Errorf("text content cannot be empty")
+	}
+	if tc.TimelineEndSec <= tc.TimelineStartSec {
+		return nil, fmt.Errorf("text clip must have a positive duration")
+	}
+
+	for i := range proj.Tracks {
+		if proj.Tracks[i].ID != trackID {
+			continue
+		}
+		if proj.Tracks[i].Type != models.TrackText {
+			return nil, fmt.Errorf("track %s is not a text track", trackID)
+		}
+
+		if tc.ID == "" {
+			tc.ID = newID()
+		}
+		tc.TrackID = trackID
+		if tc.FontFamily == "" {
+			tc.FontFamily = "sans"
+		}
+		if tc.FontWeight == "" {
+			tc.FontWeight = "bold"
+		}
+		if tc.FontSize == 0 {
+			tc.FontSize = 32
+		}
+		if tc.Color == "" {
+			tc.Color = "#ffffff"
+		}
+		if tc.PositionXPercent == 0 {
+			tc.PositionXPercent = 50
+		}
+		if tc.PositionYPercent == 0 {
+			tc.PositionYPercent = 85 // lower-third default - the most common caption position
+		}
+		if tc.Alignment == "" {
+			tc.Alignment = "center"
+		}
+		if tc.Opacity == 0 {
+			tc.Opacity = 1.0
+		}
+
+		proj.Tracks[i].TextClips = append(proj.Tracks[i].TextClips, tc)
+		return proj, nil
+	}
+	return nil, fmt.Errorf("track %s not found", trackID)
+}
+
+// UpdateTextClip replaces an existing text clip's full content/styling
+// in place (the frontend's properties panel sends the complete updated
+// object on every edit, rather than per-field patches - simpler to
+// reason about and the payload is small).
+func (a *App) UpdateTextClip(clipID string, updated models.TextClip) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	if strings.TrimSpace(updated.Content) == "" {
+		return nil, fmt.Errorf("text content cannot be empty")
+	}
+	if updated.TimelineEndSec <= updated.TimelineStartSec {
+		return nil, fmt.Errorf("text clip must have a positive duration")
+	}
+
+	for i := range proj.Tracks {
+		for j := range proj.Tracks[i].TextClips {
+			if proj.Tracks[i].TextClips[j].ID != clipID {
+				continue
+			}
+			updated.ID = clipID
+			updated.TrackID = proj.Tracks[i].ID
+			proj.Tracks[i].TextClips[j] = updated
+			return proj, nil
+		}
+	}
+	return nil, fmt.Errorf("text clip %s not found", clipID)
+}
+
+// DeleteTextClip removes a text clip from whichever text track it's on.
+func (a *App) DeleteTextClip(clipID string) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	for i := range proj.Tracks {
+		before := len(proj.Tracks[i].TextClips)
+		proj.Tracks[i].TextClips = removeTextClip(proj.Tracks[i].TextClips, clipID)
+		if len(proj.Tracks[i].TextClips) != before {
+			return proj, nil
+		}
+	}
+	return nil, fmt.Errorf("text clip %s not found", clipID)
+}
+
+// MoveTextClip repositions a text clip in time (drag on the timeline),
+// preserving its duration - mirrors MoveClip's semantics for media
+// clips, minus the cross-track-overlap rejection, since text tracks
+// intentionally allow overlap.
+func (a *App) MoveTextClip(clipID string, newStartSec float64) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	for i := range proj.Tracks {
+		for j := range proj.Tracks[i].TextClips {
+			tc := &proj.Tracks[i].TextClips[j]
+			if tc.ID != clipID {
+				continue
+			}
+			duration := tc.TimelineEndSec - tc.TimelineStartSec
+			tc.TimelineStartSec = newStartSec
+			tc.TimelineEndSec = newStartSec + duration
+			return proj, nil
+		}
+	}
+	return nil, fmt.Errorf("text clip %s not found", clipID)
+}
+
+func removeTextClip(clips []models.TextClip, id string) []models.TextClip {
+	out := make([]models.TextClip, 0, len(clips))
+	for _, c := range clips {
+		if c.ID != id {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// AddTextTrack creates a new text track (analogous to how NewProject
+// seeds default video/audio tracks, but text tracks are added on demand
+// rather than always present, since not every project needs captions).
+func (a *App) AddTextTrack(name string) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	if name == "" {
+		name = fmt.Sprintf("Text %d", countTracksByType(proj, models.TrackText)+1)
+	}
+
+	maxOrder := -1
+	for _, t := range proj.Tracks {
+		if t.Type == models.TrackText && t.Order > maxOrder {
+			maxOrder = t.Order
+		}
+	}
+
+	proj.Tracks = append(proj.Tracks, models.Track{
+		ID:        newID(),
+		Type:      models.TrackText,
+		Name:      name,
+		Order:     maxOrder + 1,
+		TextClips: []models.TextClip{},
+	})
+	return proj, nil
+}
+
+func countTracksByType(proj *models.Project, t models.TrackType) int {
+	count := 0
+	for _, track := range proj.Tracks {
+		if track.Type == t {
+			count++
+		}
+	}
+	return count
 }
 
 // --- Media import (bound methods) ---

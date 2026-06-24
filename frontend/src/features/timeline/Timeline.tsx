@@ -1,8 +1,9 @@
 import { useRef, useCallback, useEffect, useState } from "react";
-import { ZoomIn, ZoomOut, Scissors, Copy, Trash2 } from "lucide-react";
+import { ZoomIn, ZoomOut, Scissors, Copy, Trash2, Type } from "lucide-react";
 import { useEditorStore, timelineDurationSec } from "../../stores/editorStore";
 import { TimeRuler } from "./TimeRuler";
 import { TimelineTrack } from "./TimelineTrack";
+import { TextClipPanel } from "./TextClipPanel";
 
 export function Timeline() {
   const project = useEditorStore((s) => s.project);
@@ -15,9 +16,12 @@ export function Timeline() {
   const deleteSelectedClip = useEditorStore((s) => s.deleteSelectedClip);
   const duplicateSelectedClip = useEditorStore((s) => s.duplicateSelectedClip);
   const selectClip = useEditorStore((s) => s.selectClip);
+  const ensureTextTrack = useEditorStore((s) => s.ensureTextTrack);
+  const addTextClip = useEditorStore((s) => s.addTextClip);
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const [clipboardClipId, setClipboardClipId] = useState<string | null>(null);
+  const [editingTextClipId, setEditingTextClipId] = useState<string | null>(null);
 
   const duration = timelineDurationSec(project);
   const totalWidth = Math.max(duration + 30, 60) * pixelsPerSecond + 200;
@@ -75,14 +79,46 @@ export function Timeline() {
     selectClip(null);
   }, [selectClip]);
 
+  const handleAddText = useCallback(async () => {
+    try {
+      const trackId = await ensureTextTrack();
+      const start = playheadSec;
+      await addTextClip(trackId, {
+        timelineStartSec: start,
+        timelineEndSec: start + 3,
+        content: "New text",
+        fontFamily: "sans",
+        fontSize: 32,
+        fontWeight: "bold",
+        color: "#ffffff",
+        positionXPercent: 50,
+        positionYPercent: 85,
+        alignment: "center",
+        outlineEnabled: true,
+        outlineColor: "#000000",
+        outlineWidth: 2,
+        shadowEnabled: false,
+        shadowColor: "#000000",
+        opacity: 1,
+      });
+    } catch {
+      // error already surfaced via the store's lastError state
+    }
+  }, [ensureTextTrack, addTextClip, playheadSec]);
+
   if (!project) {
     return <div className="flex-1 flex items-center justify-center text-text-tertiary text-sm">No project open</div>;
   }
 
   // Sort tracks for display: video tracks highest-order-first (so track
   // "Video 2" visually sits above "Video 1", matching its compositing
-  // priority), then audio tracks below all video tracks.
+  // priority), then text tracks, then audio tracks at the bottom -
+  // mirroring the export pipeline's layering (text always composites
+  // above every video track; audio has no visual stacking order at all,
+  // it's just placed last for a sensible "video on top, sound below"
+  // reading order).
   const videoTracks = [...project.tracks].filter((t) => t.type === "video").sort((a, b) => b.order - a.order);
+  const textTracks = [...project.tracks].filter((t) => t.type === "text").sort((a, b) => b.order - a.order);
   const audioTracks = [...project.tracks].filter((t) => t.type === "audio").sort((a, b) => b.order - a.order);
 
   return (
@@ -114,6 +150,17 @@ export function Timeline() {
           <Trash2 size={14} />
         </button>
 
+        <div className="h-4 w-px bg-border-subtle mx-1" />
+
+        <button
+          onClick={handleAddText}
+          className="flex items-center gap-1.5 px-2 py-1 rounded text-text-secondary hover:text-text-primary hover:bg-surface-3 transition-colors text-xs"
+          title="Add text at playhead"
+        >
+          <Type size={14} />
+          Add Text
+        </button>
+
         <div className="flex-1" />
 
         <button onClick={() => setZoom(pixelsPerSecond / 1.4)} className="p-1.5 text-text-secondary hover:text-text-primary transition-colors" title="Zoom out">
@@ -133,11 +180,34 @@ export function Timeline() {
 
         <div className="relative">
           {videoTracks.map((track) => (
-            <TimelineTrack key={track.id} track={track} project={project} pixelsPerSecond={pixelsPerSecond} totalWidth={totalWidth} />
+            <TimelineTrack
+              key={track.id}
+              track={track}
+              project={project}
+              pixelsPerSecond={pixelsPerSecond}
+              totalWidth={totalWidth}
+            />
+          ))}
+          {textTracks.length > 0 && <div className="h-2 bg-surface-0" style={{ width: totalWidth + 144 }} />}
+          {textTracks.map((track) => (
+            <TimelineTrack
+              key={track.id}
+              track={track}
+              project={project}
+              pixelsPerSecond={pixelsPerSecond}
+              totalWidth={totalWidth}
+              onEditTextClip={setEditingTextClipId}
+            />
           ))}
           <div className="h-2 bg-surface-0" style={{ width: totalWidth + 144 }} />
           {audioTracks.map((track) => (
-            <TimelineTrack key={track.id} track={track} project={project} pixelsPerSecond={pixelsPerSecond} totalWidth={totalWidth} />
+            <TimelineTrack
+              key={track.id}
+              track={track}
+              project={project}
+              pixelsPerSecond={pixelsPerSecond}
+              totalWidth={totalWidth}
+            />
           ))}
 
           {/* Playhead line spanning all track lanes */}
@@ -147,6 +217,8 @@ export function Timeline() {
           />
         </div>
       </div>
+
+      {editingTextClipId && <TextClipPanel clipId={editingTextClipId} onClose={() => setEditingTextClipId(null)} />}
     </div>
   );
 }

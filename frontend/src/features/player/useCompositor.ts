@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback } from "react";
-import type { Project, Clip, Track } from "../../types/project";
+import type { Project, Clip, Track, TextClip } from "../../types/project";
 
 /**
  * useCompositor drives a <canvas> preview by:
@@ -210,6 +210,18 @@ export function useCompositor(
       ctx.globalAlpha = 1;
     }
 
+    // Text layers - always drawn above every video track, matching the
+    // export pipeline's drawtext chain (see backend/export/builder.go),
+    // which always composites text as the last stage before the final
+    // format normalization.
+    const textTracks = project.tracks.filter((t) => t.type === "text" && !t.hidden).sort((a, b) => a.order - b.order);
+    for (const track of textTracks) {
+      for (const tc of track.textClips) {
+        if (playheadSec < tc.timelineStartSec || playheadSec >= tc.timelineEndSec) continue;
+        drawTextClip(ctx, tc, canvas.width, canvas.height);
+      }
+    }
+
     rafRef.current = requestAnimationFrame(drawFrame);
   }, [project, playheadSec, isPlaying, canvasRef, findActiveClip]);
 
@@ -254,4 +266,73 @@ function drawContained(
   const y = (canvasHeight - drawHeight) / 2;
 
   ctx.drawImage(source, x, y, drawWidth, drawHeight);
+}
+
+/**
+ * Maps a TextClip.fontFamily key to a CSS font-family stack for Canvas
+ * 2D rendering. Mirrors backend/export/builder.go's fontRegistry()
+ * mapping of the same keys to bundled .ttf file paths - the actual
+ * glyph shapes will differ slightly (browser system font vs. the
+ * bundled DejaVu files used at export time) since loading and using a
+ * custom @font-face purely for canvas preview accuracy isn't worth the
+ * complexity in Phase 1, but the family *category* (sans/serif/mono)
+ * and weight always match, so preview and export agree closely enough
+ * for positioning, sizing, and timing decisions - the things that
+ * actually matter while editing.
+ */
+function fontFamilyToCss(fontFamily: string): string {
+  switch (fontFamily) {
+    case "serif":
+      return "Georgia, 'Times New Roman', serif";
+    case "mono":
+      return "'Courier New', monospace";
+    default:
+      return "Arial, Helvetica, sans-serif";
+  }
+}
+
+/**
+ * drawTextClip renders one TextClip onto the canvas using Canvas 2D's
+ * text APIs, matching the positioning/styling semantics of the export
+ * pipeline's drawtext filter (see backend/export/builder.go) as closely
+ * as Canvas 2D allows:
+ *   - position percentages mark the CENTER of the text, same as the
+ *     export filter's x/y expressions subtract half the measured
+ *     text_w/text_h.
+ *   - outline is drawn via strokeText before fillText (canvas has no
+ *     direct equivalent of drawtext's bordercolor/borderw, but stroking
+ *     then filling produces the same visual effect).
+ *   - shadow uses native canvas shadow properties, approximating
+ *     drawtext's shadowx/shadowy/shadowcolor.
+ */
+function drawTextClip(ctx: CanvasRenderingContext2D, tc: TextClip, canvasWidth: number, canvasHeight: number) {
+  const fontWeight = tc.fontWeight === "bold" ? "bold" : "normal";
+  const fontStack = fontFamilyToCss(tc.fontFamily);
+
+  ctx.save();
+  ctx.font = `${fontWeight} ${tc.fontSize}px ${fontStack}`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.globalAlpha = tc.opacity ?? 1;
+
+  const x = (tc.positionXPercent / 100) * canvasWidth;
+  const y = (tc.positionYPercent / 100) * canvasHeight;
+
+  if (tc.shadowEnabled) {
+    ctx.shadowColor = tc.shadowColor || "rgba(0,0,0,0.5)";
+    ctx.shadowOffsetX = 2;
+    ctx.shadowOffsetY = 2;
+    ctx.shadowBlur = 2;
+  }
+
+  if (tc.outlineEnabled && tc.outlineWidth > 0) {
+    ctx.lineWidth = tc.outlineWidth * 2; // canvas strokes centered on the path; double width to match drawtext's border appearing fully outside the glyph
+    ctx.strokeStyle = tc.outlineColor || "#000000";
+    ctx.strokeText(tc.content, x, y);
+  }
+
+  ctx.fillStyle = tc.color || "#ffffff";
+  ctx.fillText(tc.content, x, y);
+
+  ctx.restore();
 }
