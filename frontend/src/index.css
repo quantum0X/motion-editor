@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+@theme {
+  --color-surface-0: #0d0d10;
+  --color-surface-1: #15151a;
+  --color-surface-2: #1c1c22;
+  --color-surface-3: #25252d;
+  --color-border-subtle: #2e2e38;
+  --color-border-strong: #3a3a46;
+  --color-text-primary: #e8e8ec;
+  --color-text-secondary: #9a9aa6;
+  --color-text-tertiary: #5e5e6b;
+  --color-accent: #4d7fff;
+  --color-accent-dim: #2d4a99;
+  --color-track-video: #3a4a5c;
+  --color-track-video-clip: #4a6a8c;
+  --color-track-audio: #5c4a3a;
+  --color-track-audio-clip: #8c6a4a;
+  --color-danger: #e25c5c;
+
+  --font-ui: -apple-system, "Inter", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  margin: 0;
+  height: 100%;
+  background: var(--color-surface-0);
+  color: var(--color-text-primary);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* Allow text selection inside specific editable areas (text tool input, naming fields) */
+input, textarea {
+  user-select: text;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-surface-1);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-tertiary);
+}
+
+.font-mono-tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+button:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
