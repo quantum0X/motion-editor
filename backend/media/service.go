@@ -257,8 +257,8 @@ func (s *Service) generateThumbnail(filePath, projectDir, assetID string, mediaT
 // it collects per-file errors so e.g. one corrupt file in a batch of 50
 // doesn't block importing the other 49.
 type ImportResult struct {
-	Asset *models.MediaAsset
-	Error string
+	Asset *models.MediaAsset `json:"asset"`
+	Error string             `json:"error"`
 }
 
 func (s *Service) ImportFiles(filePaths []string, projectDir string) []ImportResult {

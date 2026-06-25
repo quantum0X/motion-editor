@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from "uuid";
 import type { EditorBackend } from "./EditorBackend";
-import type { Project, Clip, TextClip, Track, MediaAsset, ExportProgress } from "../types/project";
+import type { Project, Clip, TextClip, Track, MediaAsset, ExportProgress, AppSettings } from "../types/project";
 
 /**
  * In-browser mock of the Go backend. Mirrors the validation/mutation
@@ -36,6 +36,20 @@ function makeEmptyProject(name: string, w = 1920, h = 1080, fps = 30): Project {
 export function createMockBackend(): EditorBackend {
   let project: Project = makeEmptyProject("Untitled Project");
   const progressListeners: ((p: ExportProgress) => void)[] = [];
+  // Dev-mode mock settings - persisted to localStorage purely so a page
+  // reload during development doesn't re-trigger the first-launch
+  // location picker every time, which would be annoying to test against
+  // repeatedly. The real Wails backend persists this to a real
+  // settings.json file on disk instead (see backend/project/service.go).
+  let mockSettings: AppSettings = (() => {
+    try {
+      const raw = window.localStorage?.getItem("mock-app-settings");
+      if (raw) return JSON.parse(raw);
+    } catch {
+      /* ignore - fall through to default below */
+    }
+    return { projectsRootDir: "/mock/Projects", hasCompletedSetup: false };
+  })();
 
   function findClip(clipId: string): { clip: Clip; track: Track } | null {
     for (const track of project.tracks) {
@@ -90,6 +104,35 @@ export function createMockBackend(): EditorBackend {
 
     async getCurrentProject() {
       return structuredClone(project);
+    },
+
+    async getSettings() {
+      return { ...mockSettings };
+    },
+
+    async setProjectsRootDir(dir) {
+      mockSettings = { projectsRootDir: dir, hasCompletedSetup: true };
+      try {
+        window.localStorage?.setItem("mock-app-settings", JSON.stringify(mockSettings));
+      } catch {
+        /* ignore - dev convenience only */
+      }
+      return { ...mockSettings };
+    },
+
+    async openDirectoryDialog() {
+      // Browsers have no API to let the user pick and return a real
+      // filesystem folder path (the File System Access API returns an
+      // opaque handle, not a path string) - dev mode simulates a choice
+      // instead of leaving this entirely non-functional, since exercising
+      // the "what happens after a location is chosen" flow matters more
+      // here than the native picker UI itself, which is what the real
+      // Wails OpenDirectoryDialog provides.
+      return "/mock/Documents/VideoEditorProjects";
+    },
+
+    async getProjectsRootDir() {
+      return mockSettings.projectsRootDir;
     },
 
     async addClipToTrack(trackId, clipInput) {

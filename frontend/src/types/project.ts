@@ -103,3 +103,8 @@ export interface RecentEntry {
   name: string;
   lastOpened: string;
 }
+
+export interface AppSettings {
+  projectsRootDir: string;
+  hasCompletedSetup: boolean;
+}

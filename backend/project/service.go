@@ -43,9 +43,18 @@ const (
 // window.go.project.Service.<MethodName>(...).
 type Service struct {
 	// RootDir is the top-level "Projects" folder under which every
-	// individual project gets its own subfolder. Defaults to a
-	// per-OS user data directory; see NewService.
+	// individual project gets its own subfolder. User-configurable (see
+	// AppSettings/SetProjectsRootDir) so projects can live in a synced
+	// folder (Dropbox, Google Drive, etc.) shared across devices, rather
+	// than being locked to a per-machine app-data directory.
 	RootDir string
+
+	// settingsPath is always at a fixed, OS-standard app-config location
+	// (NOT user-configurable - this is the one file that must be
+	// findable on next launch without already knowing where the user
+	// chose to put their projects). It stores AppSettings, including
+	// which RootDir the user picked.
+	settingsPath string
 
 	// recentProjectsPath is a small JSON file (outside any single
 	// project folder) tracking recently opened project paths.
@@ -58,6 +67,20 @@ type Service struct {
 	currentDir string
 }
 
+// AppSettings persists app-level configuration that isn't tied to any
+// single project - currently just where new projects are created by
+// default. Stored at a fixed OS-standard location (settings.json next to
+// recent_projects.json) so the app can find it on launch before it knows
+// anything else about the user's setup.
+type AppSettings struct {
+	ProjectsRootDir string `json:"projectsRootDir"`
+	// HasCompletedSetup distinguishes "user explicitly confirmed a
+	// location" from "this is the first-ever launch and we fell back to
+	// a default" - the frontend uses this to decide whether to show the
+	// location-picker step before the new-project screen.
+	HasCompletedSetup bool `json:"hasCompletedSetup"`
+}
+
 // RecentEntry is one row in recent_projects.json. Exported because
 // app.go's RecentProjects binding returns these directly to the frontend.
 type RecentEntry struct {
@@ -66,22 +89,32 @@ type RecentEntry struct {
 	LastOpened time.Time `json:"lastOpened"`
 }
 
-// NewService creates the project service, ensuring the root "Projects"
-// directory and the recent-projects index file exist.
-//
-// baseDataDir should be an OS-appropriate app data directory (e.g. from
-// Wails: os.UserConfigDir() + "/VideoEditor"); passing it in rather than
-// computing it here keeps this package testable without touching the
-// real filesystem location.
+// NewService creates the project service. baseDataDir is the fixed,
+// OS-standard app-config directory (e.g. os.UserConfigDir() +
+// "/VideoEditor") used for settings.json and recent_projects.json - this
+// location is never user-configurable, since the app needs to find it on
+// launch before it knows anything else. The actual *projects* root
+// (RootDir) defaults to baseDataDir + "/Projects" but is then loaded from
+// settings.json if the user previously chose a different location (see
+// SetProjectsRootDir).
 func NewService(baseDataDir string) (*Service, error) {
-	root := filepath.Join(baseDataDir, "Projects")
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return nil, fmt.Errorf("creating projects root dir: %w", err)
+	if err := os.MkdirAll(baseDataDir, 0o755); err != nil {
+		return nil, fmt.Errorf("creating app config dir: %w", err)
 	}
 
 	s := &Service{
-		RootDir:            root,
+		settingsPath:       filepath.Join(baseDataDir, "settings.json"),
 		recentProjectsPath: filepath.Join(baseDataDir, "recent_projects.json"),
+	}
+
+	settings, err := s.loadOrInitSettings(baseDataDir)
+	if err != nil {
+		return nil, fmt.Errorf("loading app settings: %w", err)
+	}
+	s.RootDir = settings.ProjectsRootDir
+
+	if err := os.MkdirAll(s.RootDir, 0o755); err != nil {
+		return nil, fmt.Errorf("creating projects root dir %s: %w", s.RootDir, err)
 	}
 
 	if _, err := os.Stat(s.recentProjectsPath); os.IsNotExist(err) {
@@ -91,6 +124,67 @@ func NewService(baseDataDir string) (*Service, error) {
 	}
 
 	return s, nil
+}
+
+// loadOrInitSettings reads settings.json, or creates it with a sensible
+// default (baseDataDir/Projects, HasCompletedSetup=false) if it doesn't
+// exist yet - i.e. genuinely first launch.
+func (s *Service) loadOrInitSettings(baseDataDir string) (*AppSettings, error) {
+	var settings AppSettings
+	err := readJSON(s.settingsPath, &settings)
+	if err == nil && settings.ProjectsRootDir != "" {
+		return &settings, nil
+	}
+
+	// First launch, or a corrupted/incomplete settings file - fall back
+	// to the default location but leave HasCompletedSetup false so the
+	// frontend still offers the explicit location-choice step.
+	defaultSettings := &AppSettings{
+		ProjectsRootDir:   filepath.Join(baseDataDir, "Projects"),
+		HasCompletedSetup: false,
+	}
+	if writeErr := writeJSON(s.settingsPath, defaultSettings); writeErr != nil {
+		return nil, writeErr
+	}
+	return defaultSettings, nil
+}
+
+// GetSettings returns the current app settings, for the frontend to
+// check HasCompletedSetup on launch.
+func (s *Service) GetSettings() (*AppSettings, error) {
+	var settings AppSettings
+	if err := readJSON(s.settingsPath, &settings); err != nil {
+		return nil, fmt.Errorf("reading settings: %w", err)
+	}
+	return &settings, nil
+}
+
+// SetProjectsRootDir updates where new projects are created by default,
+// persists the choice to settings.json, and marks setup as completed so
+// the frontend won't prompt again on next launch. This does NOT move any
+// existing projects - it only changes where *future* NewProject calls
+// default to, and where RecentProjects/project browsing looks. Moving a
+// user's existing project tree automatically would be a surprising,
+// potentially destructive thing to do silently; if "move my projects"
+// becomes a real need, it should be its own explicit, confirmed action.
+func (s *Service) SetProjectsRootDir(dir string) (*AppSettings, error) {
+	if dir == "" {
+		return nil, fmt.Errorf("projects root directory cannot be empty")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("creating projects directory %s: %w", dir, err)
+	}
+
+	settings := &AppSettings{
+		ProjectsRootDir:   dir,
+		HasCompletedSetup: true,
+	}
+	if err := writeJSON(s.settingsPath, settings); err != nil {
+		return nil, fmt.Errorf("saving settings: %w", err)
+	}
+
+	s.RootDir = dir
+	return settings, nil
 }
 
 // projectSubdirs lists every folder created under a new project directory.

@@ -5,6 +5,7 @@ import type {
   ExportSettings,
   ExportProgress,
   RecentEntry,
+  AppSettings,
 } from "../types/project";
 
 /**
@@ -33,6 +34,12 @@ export interface EditorBackend {
   autoSave(): Promise<void>;
   recentProjects(): Promise<RecentEntry[]>;
   getCurrentProject(): Promise<Project | null>;
+
+  // App settings (projects storage location)
+  getSettings(): Promise<AppSettings>;
+  setProjectsRootDir(dir: string): Promise<AppSettings>;
+  openDirectoryDialog(): Promise<string>;
+  getProjectsRootDir(): Promise<string>;
 
   // Timeline mutation
   addClipToTrack(trackId: string, clip: Partial<Clip> & Pick<Clip, "assetId" | "trackId" | "timelineStartSec" | "timelineEndSec" | "sourceInSec" | "sourceOutSec">): Promise<Project>;

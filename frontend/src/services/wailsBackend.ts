@@ -1,5 +1,5 @@
 import type { EditorBackend } from "./EditorBackend";
-import type { Project, Clip, TextClip, ExportSettings, ExportProgress } from "../types/project";
+import type { Project, Clip, TextClip, ExportSettings, ExportProgress, AppSettings } from "../types/project";
 
 // Wails injects a `window.go.main.App.<MethodName>` function for every
 // bound method on the Go App struct, plus `window.runtime.EventsOn` for
@@ -18,19 +18,23 @@ declare global {
           AutoSave(): Promise<void>;
           RecentProjects(): Promise<any[]>;
           GetCurrentProject(): Promise<Project | null>;
+          GetSettings(): Promise<AppSettings>;
+          SetProjectsRootDir(dir: string): Promise<AppSettings>;
+          OpenDirectoryDialog(): Promise<string>;
+          GetProjectsRootDir(): Promise<string>;
           AddClipToTrack(trackId: string, clip: Partial<Clip>): Promise<Project>;
           MoveClip(clipId: string, newTrackId: string, newStart: number): Promise<Project>;
           TrimClip(clipId: string, newStart: number, newEnd: number): Promise<Project>;
           SplitClip(clipId: string, splitAt: number): Promise<Project>;
           DeleteClip(clipId: string): Promise<Project>;
-          DuplicateClip(clipId: string): Promise<[Project, string]>;
+          DuplicateClip(clipId: string): Promise<{ project: Project; newClipId: string }>;
           AddTextTrack(name: string): Promise<Project>;
           AddTextClip(trackId: string, clip: Partial<TextClip>): Promise<Project>;
           UpdateTextClip(clipId: string, updated: TextClip): Promise<Project>;
           DeleteTextClip(clipId: string): Promise<Project>;
           MoveTextClip(clipId: string, newStart: number): Promise<Project>;
           OpenFileDialog(): Promise<string[]>;
-          ImportMediaFiles(paths: string[]): Promise<[Project, any[]]>;
+          ImportMediaFiles(paths: string[]): Promise<{ project: Project; results: any[] }>;
           StartExport(settings: ExportSettings): Promise<string>;
           CancelExport(): Promise<void>;
         };
@@ -53,6 +57,10 @@ export function createWailsBackend(): EditorBackend {
     autoSave: () => api.AutoSave(),
     recentProjects: () => api.RecentProjects(),
     getCurrentProject: () => api.GetCurrentProject(),
+    getSettings: () => api.GetSettings(),
+    setProjectsRootDir: (dir) => api.SetProjectsRootDir(dir),
+    openDirectoryDialog: () => api.OpenDirectoryDialog(),
+    getProjectsRootDir: () => api.GetProjectsRootDir(),
 
     addClipToTrack: (trackId, clip) => api.AddClipToTrack(trackId, clip),
     moveClip: (clipId, newTrackId, newStart) => api.MoveClip(clipId, newTrackId, newStart),
@@ -60,8 +68,8 @@ export function createWailsBackend(): EditorBackend {
     splitClip: (clipId, splitAt) => api.SplitClip(clipId, splitAt),
     deleteClip: (clipId) => api.DeleteClip(clipId),
     duplicateClip: async (clipId) => {
-      const [project, newClipId] = await api.DuplicateClip(clipId);
-      return { project, newClipId };
+      const result = await api.DuplicateClip(clipId);
+      return { project: result.project, newClipId: result.newClipId };
     },
 
     addTextTrack: (name) => api.AddTextTrack(name),
@@ -72,11 +80,11 @@ export function createWailsBackend(): EditorBackend {
 
     openFileDialog: () => api.OpenFileDialog(),
     importMediaFiles: async (paths) => {
-      const [project, rawResults] = await api.ImportMediaFiles(paths);
-      const errors = (rawResults || [])
-        .filter((r: any) => r.Error)
-        .map((r: any) => ({ error: r.Error as string }));
-      return { project, errors };
+      const result = await api.ImportMediaFiles(paths);
+      const errors = (result.results || [])
+        .filter((r: any) => r.error)
+        .map((r: any) => ({ error: r.error as string }));
+      return { project: result.project, errors };
     },
 
     startExport: (settings) => api.StartExport(settings),

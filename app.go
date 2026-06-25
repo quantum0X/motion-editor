@@ -120,6 +120,38 @@ func (a *App) GetCurrentProject() *models.Project {
 	return a.projectSvc.CurrentProject()
 }
 
+// --- App settings (projects location) ---
+
+func (a *App) GetSettings() (*project.AppSettings, error) {
+	return a.projectSvc.GetSettings()
+}
+
+// SetProjectsRootDir updates where new projects are created by default.
+// Called after the user picks a folder via OpenDirectoryDialog on first
+// launch (or later from a settings screen) - pointing this at a synced
+// folder (Dropbox, Google Drive, iCloud Drive, etc.) is how project.json
+// files and their assets/cache/thumbnails end up shared across devices,
+// since this app has no server-side sync of its own.
+func (a *App) SetProjectsRootDir(dir string) (*project.AppSettings, error) {
+	return a.projectSvc.SetProjectsRootDir(dir)
+}
+
+// OpenDirectoryDialog wraps the native OS folder picker, used for the
+// first-launch "where should your projects live?" step and for a later
+// "change projects location" settings action.
+func (a *App) OpenDirectoryDialog() (string, error) {
+	return runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: "Choose where to store your video projects",
+	})
+}
+
+// GetProjectsRootDir is a convenience accessor so the frontend doesn't
+// need to round-trip through GetSettings just to display the current
+// location in a "Browse Projects" or settings view.
+func (a *App) GetProjectsRootDir() string {
+	return a.projectSvc.RootDir
+}
+
 // --- Project mutation: timeline edits ---
 //
 // These methods mutate the in-memory current project directly (via
@@ -343,10 +375,24 @@ func (a *App) DeleteClip(clipID string) (*models.Project, error) {
 // own end point (a common "duplicate" shortcut behavior), returning the
 // new clip's ID along with the updated project so the frontend can
 // immediately select the new copy.
-func (a *App) DuplicateClip(clipID string) (*models.Project, string, error) {
+// DuplicateClipResult wraps DuplicateClip's output. Wails v2 does not
+// reliably marshal Go methods with more than two return values (a value
+// + error) into something the JS side can destructure - a 3-value
+// return like (*Project, string, error) can arrive on the frontend in a
+// shape that isn't array-like, causing a confusing "is not iterable"
+// error at the call site instead of a clean type mismatch. Wrapping the
+// "extra" value in a struct alongside Project sidesteps this entirely:
+// every bound method here follows the safe (value, error) or (*T, error)
+// shape, never (*T, U, error).
+type DuplicateClipResult struct {
+	Project   *models.Project `json:"project"`
+	NewClipID string          `json:"newClipId"`
+}
+
+func (a *App) DuplicateClip(clipID string) (*DuplicateClipResult, error) {
 	proj := a.projectSvc.CurrentProject()
 	if proj == nil {
-		return nil, "", fmt.Errorf("no project is open")
+		return nil, fmt.Errorf("no project is open")
 	}
 	for i := range proj.Tracks {
 		for _, clip := range proj.Tracks[i].Clips {
@@ -361,15 +407,15 @@ func (a *App) DuplicateClip(clipID string) (*models.Project, string, error) {
 
 			for _, existing := range proj.Tracks[i].Clips {
 				if copyClip.TimelineStartSec < existing.TimelineEndSec && copyClip.TimelineEndSec > existing.TimelineStartSec {
-					return nil, "", fmt.Errorf("no room to duplicate clip immediately after itself - move it first")
+					return nil, fmt.Errorf("no room to duplicate clip immediately after itself - move it first")
 				}
 			}
 
 			proj.Tracks[i].Clips = append(proj.Tracks[i].Clips, copyClip)
-			return proj, copyClip.ID, nil
+			return &DuplicateClipResult{Project: proj, NewClipID: copyClip.ID}, nil
 		}
 	}
-	return nil, "", fmt.Errorf("clip %s not found", clipID)
+	return nil, fmt.Errorf("clip %s not found", clipID)
 }
 
 func removeClip(clips []models.Clip, id string) []models.Clip {
@@ -572,15 +618,24 @@ func countTracksByType(proj *models.Project, t models.TrackType) int {
 
 // --- Media import (bound methods) ---
 
+// ImportMediaFilesResult wraps ImportMediaFiles' output for the same
+// reason as DuplicateClipResult above - Wails v2 does not reliably
+// support more than (value, error) as a Go method's return shape on the
+// JS side.
+type ImportMediaFilesResult struct {
+	Project *models.Project      `json:"project"`
+	Results []media.ImportResult `json:"results"`
+}
+
 // ImportMediaFiles probes and generates thumbnails for the given file
 // paths (typically from a native file-picker dialog or drag-and-drop drop
 // event resolved to absolute paths by the frontend), appends successfully
 // imported assets to the current project's Assets list, and returns the
 // updated project plus any per-file errors.
-func (a *App) ImportMediaFiles(filePaths []string) (*models.Project, []media.ImportResult, error) {
+func (a *App) ImportMediaFiles(filePaths []string) (*ImportMediaFilesResult, error) {
 	proj := a.projectSvc.CurrentProject()
 	if proj == nil {
-		return nil, nil, fmt.Errorf("no project is open")
+		return nil, fmt.Errorf("no project is open")
 	}
 
 	projectDir := a.projectSvc.CurrentProjectDir()
@@ -592,7 +647,7 @@ func (a *App) ImportMediaFiles(filePaths []string) (*models.Project, []media.Imp
 		}
 	}
 
-	return proj, results, nil
+	return &ImportMediaFilesResult{Project: proj, Results: results}, nil
 }
 
 // OpenFileDialog wraps the native OS file picker, restricted to media
