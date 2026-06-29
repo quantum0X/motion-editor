@@ -616,6 +616,335 @@ func countTracksByType(proj *models.Project, t models.TrackType) int {
 	return count
 }
 
+// --- Subtitle clip mutation ---
+//
+// Mirrors the text clip mutation methods above almost exactly -
+// SubtitleClip is intentionally a smaller, fixed-styling sibling of
+// TextClip (see models.SubtitleClip's doc comment), so its CRUD surface
+// is correspondingly simpler: no per-clip font/color/position fields to
+// validate or default.
+
+func (a *App) AddSubtitleTrack(name string) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	if name == "" {
+		name = fmt.Sprintf("Subtitles %d", countTracksByType(proj, models.TrackSubtitle)+1)
+	}
+	maxOrder := -1
+	for _, t := range proj.Tracks {
+		if t.Type == models.TrackSubtitle && t.Order > maxOrder {
+			maxOrder = t.Order
+		}
+	}
+	proj.Tracks = append(proj.Tracks, models.Track{
+		ID:            newID(),
+		Type:          models.TrackSubtitle,
+		Name:          name,
+		Order:         maxOrder + 1,
+		SubtitleClips: []models.SubtitleClip{},
+	})
+	return proj, nil
+}
+
+func (a *App) AddSubtitleClip(trackID string, sc models.SubtitleClip) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	if strings.TrimSpace(sc.Content) == "" {
+		return nil, fmt.Errorf("subtitle content cannot be empty")
+	}
+	if sc.TimelineEndSec <= sc.TimelineStartSec {
+		return nil, fmt.Errorf("subtitle clip must have a positive duration")
+	}
+	for i := range proj.Tracks {
+		if proj.Tracks[i].ID != trackID {
+			continue
+		}
+		if proj.Tracks[i].Type != models.TrackSubtitle {
+			return nil, fmt.Errorf("track %s is not a subtitle track", trackID)
+		}
+		if sc.ID == "" {
+			sc.ID = newID()
+		}
+		sc.TrackID = trackID
+		proj.Tracks[i].SubtitleClips = append(proj.Tracks[i].SubtitleClips, sc)
+		return proj, nil
+	}
+	return nil, fmt.Errorf("track %s not found", trackID)
+}
+
+func (a *App) UpdateSubtitleClip(clipID string, updated models.SubtitleClip) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	if strings.TrimSpace(updated.Content) == "" {
+		return nil, fmt.Errorf("subtitle content cannot be empty")
+	}
+	if updated.TimelineEndSec <= updated.TimelineStartSec {
+		return nil, fmt.Errorf("subtitle clip must have a positive duration")
+	}
+	for i := range proj.Tracks {
+		for j := range proj.Tracks[i].SubtitleClips {
+			if proj.Tracks[i].SubtitleClips[j].ID != clipID {
+				continue
+			}
+			updated.ID = clipID
+			updated.TrackID = proj.Tracks[i].ID
+			proj.Tracks[i].SubtitleClips[j] = updated
+			return proj, nil
+		}
+	}
+	return nil, fmt.Errorf("subtitle clip %s not found", clipID)
+}
+
+func (a *App) DeleteSubtitleClip(clipID string) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	for i := range proj.Tracks {
+		before := len(proj.Tracks[i].SubtitleClips)
+		out := make([]models.SubtitleClip, 0, before)
+		for _, c := range proj.Tracks[i].SubtitleClips {
+			if c.ID != clipID {
+				out = append(out, c)
+			}
+		}
+		proj.Tracks[i].SubtitleClips = out
+		if len(out) != before {
+			return proj, nil
+		}
+	}
+	return nil, fmt.Errorf("subtitle clip %s not found", clipID)
+}
+
+// --- Effect mutation (on media clips) ---
+
+// AddEffect appends a new effect to a clip's Effects list. Defaults
+// Enabled to true and fills a starting Params map if the caller didn't
+// send one, so a "quick add" from the frontend (just a type, no
+// pre-tuned params) still produces a usable, visible effect.
+func (a *App) AddEffect(clipID string, effect models.Effect) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	for i := range proj.Tracks {
+		for j := range proj.Tracks[i].Clips {
+			if proj.Tracks[i].Clips[j].ID != clipID {
+				continue
+			}
+			if effect.ID == "" {
+				effect.ID = newID()
+			}
+			effect.Enabled = true
+			if effect.Params == nil {
+				effect.Params = map[string]float64{}
+			}
+			proj.Tracks[i].Clips[j].Effects = append(proj.Tracks[i].Clips[j].Effects, effect)
+			return proj, nil
+		}
+	}
+	return nil, fmt.Errorf("clip %s not found", clipID)
+}
+
+// UpdateEffect replaces one effect's params/enabled state in place,
+// identified by its own ID within the owning clip's Effects list.
+func (a *App) UpdateEffect(clipID, effectID string, updated models.Effect) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	for i := range proj.Tracks {
+		for j := range proj.Tracks[i].Clips {
+			if proj.Tracks[i].Clips[j].ID != clipID {
+				continue
+			}
+			for k := range proj.Tracks[i].Clips[j].Effects {
+				if proj.Tracks[i].Clips[j].Effects[k].ID != effectID {
+					continue
+				}
+				updated.ID = effectID
+				proj.Tracks[i].Clips[j].Effects[k] = updated
+				return proj, nil
+			}
+			return nil, fmt.Errorf("effect %s not found on clip %s", effectID, clipID)
+		}
+	}
+	return nil, fmt.Errorf("clip %s not found", clipID)
+}
+
+// RemoveEffect deletes one effect from a clip's Effects list by ID.
+func (a *App) RemoveEffect(clipID, effectID string) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	for i := range proj.Tracks {
+		for j := range proj.Tracks[i].Clips {
+			if proj.Tracks[i].Clips[j].ID != clipID {
+				continue
+			}
+			clip := &proj.Tracks[i].Clips[j]
+			before := len(clip.Effects)
+			out := make([]models.Effect, 0, before)
+			for _, e := range clip.Effects {
+				if e.ID != effectID {
+					out = append(out, e)
+				}
+			}
+			clip.Effects = out
+			if len(out) == before {
+				return nil, fmt.Errorf("effect %s not found on clip %s", effectID, clipID)
+			}
+			return proj, nil
+		}
+	}
+	return nil, fmt.Errorf("clip %s not found", clipID)
+}
+
+// --- Transition mutation ---
+
+// SetTransition attaches a transition to the boundary between clipID
+// and the clip immediately following it on the same track (nextClipID).
+// Both clips must already be adjacent in time for the transition to
+// make sense at export time (see export/transitions.go) - this method
+// does not itself verify adjacency, since "adjacent" is a property of
+// the current TimelineStartSec/TimelineEndSec values and could change
+// later via a drag; the export builder validates timing at export time
+// instead and returns a clear error there if a configured transition no
+// longer fits.
+func (a *App) SetTransition(clipID string, transition models.Transition) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	if transition.DurationSec <= 0 {
+		return nil, fmt.Errorf("transition duration must be positive")
+	}
+	for i := range proj.Tracks {
+		for j := range proj.Tracks[i].Clips {
+			if proj.Tracks[i].Clips[j].ID != clipID {
+				continue
+			}
+			if transition.ID == "" {
+				transition.ID = newID()
+			}
+			proj.Tracks[i].Clips[j].Transition = &transition
+			return proj, nil
+		}
+	}
+	return nil, fmt.Errorf("clip %s not found", clipID)
+}
+
+// RemoveTransition clears any transition on the given clip (reverting
+// the boundary with its next clip back to a hard cut).
+func (a *App) RemoveTransition(clipID string) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	for i := range proj.Tracks {
+		for j := range proj.Tracks[i].Clips {
+			if proj.Tracks[i].Clips[j].ID != clipID {
+				continue
+			}
+			proj.Tracks[i].Clips[j].Transition = nil
+			return proj, nil
+		}
+	}
+	return nil, fmt.Errorf("clip %s not found", clipID)
+}
+
+// --- Keyframe mutation ---
+
+// AddKeyframe appends one keyframe to a clip's Keyframes list. Multiple
+// keyframes on the same property are expected over a clip's lifetime
+// (that's the whole point); this method does not deduplicate by
+// TimeSec, since the export builder's buildKeyframeExpression sorts and
+// processes whatever is there - if two keyframes on the same property
+// land at the same TimeSec, the later one in the slice wins at export
+// time, which mirrors "last edit wins" and avoids silently dropping data
+// the person might want to clean up themselves.
+func (a *App) AddKeyframe(clipID string, kf models.Keyframe) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	for i := range proj.Tracks {
+		for j := range proj.Tracks[i].Clips {
+			if proj.Tracks[i].Clips[j].ID != clipID {
+				continue
+			}
+			if kf.ID == "" {
+				kf.ID = newID()
+			}
+			if kf.Interpolation == "" {
+				kf.Interpolation = models.InterpolationLinear
+			}
+			proj.Tracks[i].Clips[j].Keyframes = append(proj.Tracks[i].Clips[j].Keyframes, kf)
+			return proj, nil
+		}
+	}
+	return nil, fmt.Errorf("clip %s not found", clipID)
+}
+
+func (a *App) UpdateKeyframe(clipID, keyframeID string, updated models.Keyframe) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	for i := range proj.Tracks {
+		for j := range proj.Tracks[i].Clips {
+			if proj.Tracks[i].Clips[j].ID != clipID {
+				continue
+			}
+			for k := range proj.Tracks[i].Clips[j].Keyframes {
+				if proj.Tracks[i].Clips[j].Keyframes[k].ID != keyframeID {
+					continue
+				}
+				updated.ID = keyframeID
+				proj.Tracks[i].Clips[j].Keyframes[k] = updated
+				return proj, nil
+			}
+			return nil, fmt.Errorf("keyframe %s not found on clip %s", keyframeID, clipID)
+		}
+	}
+	return nil, fmt.Errorf("clip %s not found", clipID)
+}
+
+func (a *App) RemoveKeyframe(clipID, keyframeID string) (*models.Project, error) {
+	proj := a.projectSvc.CurrentProject()
+	if proj == nil {
+		return nil, fmt.Errorf("no project is open")
+	}
+	for i := range proj.Tracks {
+		for j := range proj.Tracks[i].Clips {
+			if proj.Tracks[i].Clips[j].ID != clipID {
+				continue
+			}
+			clip := &proj.Tracks[i].Clips[j]
+			before := len(clip.Keyframes)
+			out := make([]models.Keyframe, 0, before)
+			for _, k := range clip.Keyframes {
+				if k.ID != keyframeID {
+					out = append(out, k)
+				}
+			}
+			clip.Keyframes = out
+			if len(out) == before {
+				return nil, fmt.Errorf("keyframe %s not found on clip %s", keyframeID, clipID)
+			}
+			return proj, nil
+		}
+	}
+	return nil, fmt.Errorf("clip %s not found", clipID)
+}
+
 // --- Media import (bound methods) ---
 
 // ImportMediaFilesResult wraps ImportMediaFiles' output for the same

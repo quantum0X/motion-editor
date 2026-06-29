@@ -185,3 +185,161 @@ something real to point at out of the box.
   `sample_assets/` — sandbox-only verification scaffolding used to build
   and debug this. Not part of the shipped app; safe to delete, or keep
   for reference on how the export filter graph was validated.
+
+## Bug fixes, menu bar, project location (this session, before effects work)
+
+**Real bugs found and fixed, root-caused rather than guessed:**
+1. **"is not iterable"** on selecting/importing media — Wails v2 does not
+   reliably support Go methods returning 3+ values
+   (`(*Project, string, error)`). `DuplicateClip` and `ImportMediaFiles`
+   both had this shape; fixed by wrapping the extra value into a single
+   response struct on both the Go and TypeScript sides.
+2. Drag-and-drop / click-to-import "not working" — almost certainly the
+   same root cause as #1, since both import paths call `ImportMediaFiles`.
+3. `media.ImportResult` had no JSON tags at all (relying on Go's default
+   capitalized-field-name behavior, which happened to accidentally match
+   what the frontend read) — made explicit and consistent with every
+   other type in the codebase.
+4. "Add Text not working" — could not reproduce against the mock backend;
+   most likely the same root cause as #1 in the real Wails app. Please
+   confirm fixed after rebuilding; if it persists, it has a different
+   cause and needs a fresh repro.
+
+**New features, built and verified:**
+- **Project location picker**: first-launch screen (and a later
+  File > Change Projects Location... action) lets you choose any folder
+  for projects, persisted to `settings.json`. Pointing it at a
+  Dropbox/Google Drive/iCloud folder is how projects sync across
+  devices — this app has no server-side sync of its own.
+- **In-app menu bar**: File/Edit/View/Project/Help, real dropdowns wired
+  to actual store actions (not placeholders) — New/Open/Save/Save As/
+  Export, Split/Duplicate/Delete, Zoom controls, keyboard shortcuts shown
+  inline.
+
+Both verified via real Playwright browser testing; both halves of the
+project build clean from a completely fresh zip extraction.
+
+## Effects, Transitions, Keyframes, Subtitles (this session)
+
+**Status: backend logic built and verified against real ffmpeg for all
+four. Effects and Subtitles are fully wired into the main export path
+(`export.Plan()`). Transitions and Keyframes have proven, working
+building-block functions that are NOT YET called from `Plan()` - see
+"what's actually wired" below. No frontend UI exists yet for any of the
+four.**
+
+### Effects — fully wired
+`backend/export/effects.go` converts a `models.Effect` into one FFmpeg
+filter clause (blur→boxblur, sharpen→unsharp, brightness/contrast/
+saturation→eq, vignette→vignette, grain→noise, rgbshift→rgbashift, vhs→a
+composite chain of several of the above). Effects are appended to both
+the base-track and overlay-track per-clip filter construction in
+`builder.go`, so any clip's `Effects` list is rendered automatically.
+Verified by actually rendering all five effect types stacked together
+and inspecting the output frame.
+
+**Bug found and fixed the same way as the text/%-escaping bug**: `eq`
+and `vignette` both default to `eval=init` — they evaluate any
+time-varying expression in their parameters ONCE at filter-graph
+construction, not per-frame. This doesn't affect today's static effect
+values, but would silently break the moment any effect parameter is
+ever driven by a keyframe expression. Every effect builder sets
+`eval=frame` unconditionally as a result, even though Phase 1 has no
+per-effect keyframing yet — the cost is zero and it forecloses an entire
+bug category.
+
+### Subtitles — fully wired
+`models.SubtitleClip` + `TrackSubtitle`, with `app.go` CRUD bindings
+(`AddSubtitleTrack`, `AddSubtitleClip`, `UpdateSubtitleClip`,
+`DeleteSubtitleClip`). Reuses the already-proven `drawtext` pipeline via
+a `subtitleToTextClip` adapter (fixed bottom-center white/black-outline
+styling, no per-clip font customization — see the type's doc comment for
+why) rather than duplicating the whole text-rendering pipeline. Subtitle
+layers render after text layers in the filter graph (visually on top),
+so a caption is never hidden behind a decorative title. Verified by
+rendering a real subtitle line over real video and confirming correct
+position/timing.
+
+Manual subtitle create/edit/delete only in this phase — auto-generation
+("Auto Subtitle Engine" in the original spec) is explicitly deferred,
+and whenever it's built, local-only processing (no cloud API) should
+remain a hard requirement, consistent with the rest of this app's
+offline-first design.
+
+### Transitions — backend proven, NOT yet wired into Plan()
+`backend/export/transitions.go` builds an `xfade`-based crossfade
+between two clips, with presets for fade/dissolve/wipe(4 directions)/
+slide(4 directions)/zoom (push reuses slide — xfade has no dedicated
+push preset). The exact timing model (`offset` = clip A's own trimmed
+duration minus the transition duration) was verified against real
+ffmpeg: rendered a 3s+4s two-clip sequence with a 0.5s crossfade and
+confirmed pure-A, blended, and pure-B frames land exactly where expected.
+
+**Why it's not wired into `Plan()` yet**: `xfade` consumes TWO clip
+streams and produces ONE merged output stream spanning both — this
+doesn't fit the shape of the existing base-track loop, which assumes
+each clip becomes exactly one filter-graph segment that gets `concat`'d
+in sequence. Properly integrating transitions means restructuring that
+loop to detect `Clip.Transition != nil`, pull in the next clip as a
+second input at that point, splice an `xfade` stage into the concat
+chain instead of a plain segment, and renumber every label after it.
+This is a real, contained piece of work, not started yet.
+
+`app.go` has `SetTransition`/`RemoveTransition` bindings already, so the
+data model and CRUD are ready for when the export-side wiring happens.
+
+### Keyframes — backend proven, NOT yet wired into Plan()
+`backend/export/keyframes.go` compiles a sorted `[]models.Keyframe` for
+one property into a single ffmpeg time-expression
+(`if(lt(t,T),value,...)` chain, built right-to-left), with linear/
+ease-in/ease-out/bezier-as-smoothstep interpolation. Verified by driving
+`eq`'s brightness parameter through a fade-in/hold/fade-out keyframe set
+and confirming all three phases render correctly.
+
+`backend/export/keyframes_apply.go` wires the compiled expression into
+an actual per-property filter clause:
+- **Rotation**: `rotate=angle=...` — works exactly as expected, verified
+  end-to-end.
+- **Scale ("zoom")**: a real, important constraint was discovered here —
+  a video's output frame dimensions cannot change mid-file; `scale`
+  with a time-varying w/h either errors or freezes at the first
+  evaluated size. The correct, verified technique is scale-up-then-crop-
+  back-down to the fixed canvas size (i.e. "zoom" = scale + crop, not a
+  bare animated scale). Verified: rendered a 1.0x→1.4x zoom over 2s and
+  confirmed the later frame is visibly more zoomed in than the first.
+- **Position**: same scale+crop-family technique, via `crop`'s x/y
+  offset expressions (animated independently per axis).
+- **Opacity**: **a real ffmpeg limitation was found, not worked around
+  with a hack** — `colorchannelmixer`'s `aa` (alpha gain) parameter
+  flatly rejects time-varying expressions in this ffmpeg build (no
+  `eval` option exists for that filter at all). Rather than silently
+  shipping a "keyframe" that doesn't animate, opacity keyframes are
+  supported ONLY as the simple two-point fade-in/fade-out case (covers
+  the large majority of real usage) via ffmpeg's dedicated `fade`
+  filter, and `ApplyOpacityKeyframes` returns a clear, explicit error
+  for anything more complex (3+ keyframes) rather than degrading
+  silently.
+
+**Why it's not wired into `Plan()` yet**: connecting these functions to
+real per-clip rendering means deciding, for each clip, whether ANY
+property has keyframes and if so threading the resulting filter
+clause(s) into that clip's existing trim/scale/pad/effects chain in the
+right order (rotation and position/scale interact with each other and
+with the existing scale-to-canvas step) — a design decision each
+keyframed property needs, not yet made.
+
+### Frontend: not started for any of the four
+No UI exists yet for effects, transitions, keyframes, or subtitles. The
+canvas preview also does not render any of these four yet.
+
+## Updated next steps, in order
+1. `wails dev` locally — re-confirm the bug fixes actually resolved the
+   reported issues in the real app, not just the mock backend.
+2. Wire transitions and keyframes into `export.Plan()` (see "why not
+   wired" notes above for exactly what's involved).
+3. Build frontend UI for effects (panel on selected clip), subtitles
+   (track + simple line editor, closely mirroring the text tool), then
+   transitions and keyframes (more involved UI: a transition picker at
+   clip boundaries, a keyframe timeline with draggable markers).
+4. Add canvas preview support for effects/keyframes so preview matches
+   export, the same property maintained for every other feature so far.

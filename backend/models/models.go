@@ -25,9 +25,10 @@ const (
 type TrackType string
 
 const (
-	TrackVideo TrackType = "video"
-	TrackAudio TrackType = "audio"
-	TrackText  TrackType = "text"
+	TrackVideo    TrackType = "video"
+	TrackAudio    TrackType = "audio"
+	TrackText     TrackType = "text"
+	TrackSubtitle TrackType = "subtitle"
 )
 
 // MediaAsset represents one imported source file, before it's placed on
@@ -64,18 +65,55 @@ type MediaAsset struct {
 // (SourceOutSec - SourceInSec) / Speed. We store Speed separately rather
 // than implying it, so trim and speed-change operations stay independent
 // and unambiguous when building the export filter graph.
+
+// TransitionType enumerates the supported clip-to-clip transitions.
+// Implemented via `xfade` in the export filter graph (see
+// backend/export/transitions.go) - dissolve/fade/wipe/slide are all
+// `xfade` transition presets, so adding more of xfade's ~50 built-in
+// presets later is cheap; this list covers the original spec's
+// explicit ask (fade, dissolve, zoom, slide, wipe, push).
+type TransitionType string
+
+const (
+	TransitionFade     TransitionType = "fade"
+	TransitionDissolve TransitionType = "dissolve"
+	TransitionWipe     TransitionType = "wipe"
+	TransitionSlide    TransitionType = "slide"
+	TransitionPush     TransitionType = "push"
+	TransitionZoom     TransitionType = "zoom"
+)
+
+// Transition describes a crossfade-style transition applied at the
+// boundary between two adjacent clips on the SAME track. It's attached
+// to the EARLIER clip (the one whose TimelineEndSec is the boundary) and
+// references the later clip by ID, rather than living as a standalone
+// timeline object - this guarantees a transition can never exist
+// without exactly the two clips it blends between, and moves/deletes of
+// either clip have one clear place to also invalidate the transition.
+type Transition struct {
+	ID          string            `json:"id"`
+	Type        TransitionType    `json:"type"`
+	DurationSec float64           `json:"durationSec"` // how long the two clips overlap/blend
+	NextClipID  string            `json:"nextClipId"`  // the clip immediately following this one on the same track
+	Direction   string            `json:"direction"`   // meaningful for wipe/slide/push: "left" | "right" | "up" | "down"
+	Easing      InterpolationType `json:"easing"`
+}
+
 type Clip struct {
-	ID               string  `json:"id"`
-	AssetID          string  `json:"assetId"`
-	TrackID          string  `json:"trackId"`
-	TimelineStartSec float64 `json:"timelineStartSec"`
-	TimelineEndSec   float64 `json:"timelineEndSec"`
-	SourceInSec      float64 `json:"sourceInSec"`
-	SourceOutSec     float64 `json:"sourceOutSec"`
-	Speed            float64 `json:"speed"`   // 1.0 = normal speed; reserved for later phase, must stay 1.0 in Phase 1
-	Opacity          float64 `json:"opacity"` // 0..1, video/image clips only; reserved for layering, default 1.0
-	Volume           float64 `json:"volume"`  // 0..1 (or up to 2.0 for boost), audio-bearing clips only
-	Muted            bool    `json:"muted"`
+	ID               string      `json:"id"`
+	AssetID          string      `json:"assetId"`
+	TrackID          string      `json:"trackId"`
+	TimelineStartSec float64     `json:"timelineStartSec"`
+	TimelineEndSec   float64     `json:"timelineEndSec"`
+	SourceInSec      float64     `json:"sourceInSec"`
+	SourceOutSec     float64     `json:"sourceOutSec"`
+	Speed            float64     `json:"speed"`   // 1.0 = normal speed; reserved for later phase, must stay 1.0 in Phase 1
+	Opacity          float64     `json:"opacity"` // 0..1, video/image clips only; reserved for layering, default 1.0
+	Volume           float64     `json:"volume"`  // 0..1 (or up to 2.0 for boost), audio-bearing clips only
+	Muted            bool        `json:"muted"`
+	Effects          []Effect    `json:"effects"`              // applied in array order; see Effect doc comment
+	Keyframes        []Keyframe  `json:"keyframes"`            // animates position/rotation/scale/opacity over the clip's own local time
+	Transition       *Transition `json:"transition,omitempty"` // transition INTO the next clip on this track, if any; nil means a hard cut
 }
 
 // TextClip is a title/caption placed directly on the timeline. Unlike
@@ -113,24 +151,117 @@ type TextClip struct {
 	Opacity          float64 `json:"opacity"` // 0..1
 }
 
+// SubtitleClip is one caption line. Modeled separately from TextClip
+// (rather than reusing it with different defaults) because subtitles
+// have different semantics worth keeping distinct in the data model:
+// they're typically sequential and non-overlapping (one line visible at
+// a time), commonly imported/exported as a block via SRT, and intended
+// to eventually be machine-generated (the original spec's "Auto
+// Subtitle Engine" - explicitly deferred; this phase covers manual
+// create/edit/delete only). Styling is intentionally minimal compared
+// to TextClip's full font/position/outline/shadow controls - standard
+// subtitle conventions (bottom-center, outlined white text) cover the
+// vast majority of real usage and match what SRT itself can express.
+type SubtitleClip struct {
+	ID               string  `json:"id"`
+	TrackID          string  `json:"trackId"`
+	TimelineStartSec float64 `json:"timelineStartSec"`
+	TimelineEndSec   float64 `json:"timelineEndSec"`
+	Content          string  `json:"content"`
+}
+
 // Track is an ordered lane of non-overlapping clips. Within a single
 // Track, clips must not overlap in timeline time — overlap across
 // *different* tracks is exactly what lets multiple video layers exist,
 // which is composited in preview and export by track order.
 type Track struct {
-	ID        string     `json:"id"`
-	Type      TrackType  `json:"type"`
-	Name      string     `json:"name"`
-	Order     int        `json:"order"` // lower Order = lower in the visual stack (rendered first / underneath)
-	Locked    bool       `json:"locked"`
-	Hidden    bool       `json:"hidden"` // video tracks: skip in preview/export compositing
-	Muted     bool       `json:"muted"`  // audio-bearing tracks: skip in audio mixdown
-	Clips     []Clip     `json:"clips"`
-	TextClips []TextClip `json:"textClips"` // only populated for Type == TrackText
+	ID            string         `json:"id"`
+	Type          TrackType      `json:"type"`
+	Name          string         `json:"name"`
+	Order         int            `json:"order"` // lower Order = lower in the visual stack (rendered first / underneath)
+	Locked        bool           `json:"locked"`
+	Hidden        bool           `json:"hidden"` // video tracks: skip in preview/export compositing
+	Muted         bool           `json:"muted"`  // audio-bearing tracks: skip in audio mixdown
+	Clips         []Clip         `json:"clips"`
+	TextClips     []TextClip     `json:"textClips"`     // only populated for Type == TrackText
+	SubtitleClips []SubtitleClip `json:"subtitleClips"` // only populated for Type == TrackSubtitle
 }
 
-// Project is the root object persisted as project.json inside a project
-// folder (see ProjectPaths for the on-disk layout).
+// Effect is one stackable visual effect applied to a Clip. Effects on a
+// single clip apply in array order (Clip.Effects[0] first, etc.) - this
+// matches how the export filter graph chains them: each effect becomes
+// one more comma-separated stage in that clip's existing
+// trim/scale/pad filter chain (see backend/export/builder.go).
+//
+// Params holds effect-specific values as a flat string-keyed map rather
+// than a different Go struct per effect type, since effects are
+// data-driven (added/removed/reordered freely in the UI) and this keeps
+// the JSON shape and the Go code that walks it uniform regardless of
+// which effect it is. Each EffectType's expected param keys are
+// documented next to its filter-string builder in
+// backend/export/effects.go.
+type EffectType string
+
+const (
+	EffectBlur       EffectType = "blur"
+	EffectSharpen    EffectType = "sharpen"
+	EffectBrightness EffectType = "brightness"
+	EffectContrast   EffectType = "contrast"
+	EffectSaturation EffectType = "saturation"
+	EffectVignette   EffectType = "vignette"
+	EffectGrain      EffectType = "grain"
+	EffectVHS        EffectType = "vhs"
+	EffectRGBShift   EffectType = "rgbshift"
+)
+
+type Effect struct {
+	ID     string             `json:"id"`
+	Type   EffectType         `json:"type"`
+	Params map[string]float64 `json:"params"`
+	// Enabled lets the UI toggle an effect off without losing its
+	// configured params - removing it outright would lose whatever
+	// values the person had dialed in if they re-enable it later.
+	Enabled bool `json:"enabled"`
+}
+
+// KeyframeProperty enumerates which Clip property a Keyframe track
+// animates. Phase 1 (per the original spec) covers position, rotation,
+// scale, and opacity - the four properties every NLE's basic keyframe
+// system starts with.
+type KeyframeProperty string
+
+const (
+	KeyframePositionX KeyframeProperty = "positionX" // pixels, relative to canvas
+	KeyframePositionY KeyframeProperty = "positionY"
+	KeyframeRotation  KeyframeProperty = "rotation" // degrees
+	KeyframeScale     KeyframeProperty = "scale"    // 1.0 = 100%
+	KeyframeOpacity   KeyframeProperty = "opacity"  // 0..1
+)
+
+// InterpolationType controls how values are blended between two
+// consecutive keyframes on the same property.
+type InterpolationType string
+
+const (
+	InterpolationLinear  InterpolationType = "linear"
+	InterpolationEaseIn  InterpolationType = "easeIn"
+	InterpolationEaseOut InterpolationType = "easeOut"
+	InterpolationBezier  InterpolationType = "bezier" // Phase 1 approximates bezier as ease-in-out (see export/keyframes.go) rather than accepting arbitrary control points
+)
+
+// Keyframe is one (time, value) control point on a Clip's animation
+// timeline for a given property. TimeSec is relative to the CLIP's own
+// timeline position (0 = the clip's TimelineStartSec), not the overall
+// project timeline, so a keyframe set doesn't need to be rewritten every
+// time the clip is moved on the timeline.
+type Keyframe struct {
+	ID            string            `json:"id"`
+	Property      KeyframeProperty  `json:"property"`
+	TimeSec       float64           `json:"timeSec"`
+	Value         float64           `json:"value"`
+	Interpolation InterpolationType `json:"interpolation"` // interpolation used for the segment FROM this keyframe TO the next one on the same property
+}
+
 type Project struct {
 	ID            string       `json:"id"`
 	Name          string       `json:"name"`

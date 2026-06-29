@@ -136,6 +136,16 @@ func sortedTextClips(track models.Track) []models.TextClip {
 	return clips
 }
 
+// sortedSubtitleClips mirrors sortedTextClips for SubtitleClip.
+func sortedSubtitleClips(track models.Track) []models.SubtitleClip {
+	clips := make([]models.SubtitleClip, len(track.SubtitleClips))
+	copy(clips, track.SubtitleClips)
+	sort.Slice(clips, func(i, j int) bool {
+		return clips[i].TimelineStartSec < clips[j].TimelineStartSec
+	})
+	return clips
+}
+
 // textTracksSortedByOrder returns only text tracks, sorted bottom-to-top
 // by Order, mirroring videoTracksSortedByOrder. In Phase 1 there's
 // typically just one text track, but supporting several (e.g. a
@@ -145,6 +155,19 @@ func textTracksSortedByOrder(proj *models.Project) []models.Track {
 	var tracks []models.Track
 	for _, t := range proj.Tracks {
 		if t.Type == models.TrackText && !t.Hidden {
+			tracks = append(tracks, t)
+		}
+	}
+	sort.Slice(tracks, func(i, j int) bool { return tracks[i].Order < tracks[j].Order })
+	return tracks
+}
+
+// subtitleTracksSortedByOrder mirrors textTracksSortedByOrder for
+// subtitle tracks.
+func subtitleTracksSortedByOrder(proj *models.Project) []models.Track {
+	var tracks []models.Track
+	for _, t := range proj.Tracks {
+		if t.Type == models.TrackSubtitle && !t.Hidden {
 			tracks = append(tracks, t)
 		}
 	}
@@ -242,6 +265,18 @@ func Plan(proj *models.Project, settings models.ExportSettings) (*ExportPlan, er
 		label := fmt.Sprintf("seg%d", segmentIdx)
 		clipDuration := clip.SourceOutSec - clip.SourceInSec
 
+		effectsChain, err := buildEffectsChain(clip.Effects)
+		if err != nil {
+			return nil, fmt.Errorf("clip %s: %w", clip.ID, err)
+		}
+		// Effects chain after the existing comma-separated stage, with
+		// its own leading comma - or nothing at all if there are no
+		// enabled effects, so we never emit a dangling trailing comma.
+		effectsSuffix := ""
+		if effectsChain != "" {
+			effectsSuffix = "," + effectsChain
+		}
+
 		var videoFilter string
 		if asset.MediaType == models.MediaImage {
 			// Images have no inherent duration/trim points - loop a
@@ -249,13 +284,13 @@ func Plan(proj *models.Project, settings models.ExportSettings) (*ExportPlan, er
 			// of using trim (which applies to a video stream's time
 			// axis, not a static image).
 			videoFilter = fmt.Sprintf(
-				"[%d:v]scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1,loop=loop=-1:size=1,trim=duration=%.6f,setpts=PTS-STARTPTS[%s]",
-				idx, settings.Width, settings.Height, settings.Width, settings.Height, clipDuration, label,
+				"[%d:v]scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1,loop=loop=-1:size=1,trim=duration=%.6f,setpts=PTS-STARTPTS%s[%s]",
+				idx, settings.Width, settings.Height, settings.Width, settings.Height, clipDuration, effectsSuffix, label,
 			)
 		} else {
 			videoFilter = fmt.Sprintf(
-				"[%d:v]trim=start=%.6f:end=%.6f,setpts=PTS-STARTPTS,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1[%s]",
-				idx, clip.SourceInSec, clip.SourceOutSec, settings.Width, settings.Height, settings.Width, settings.Height, label,
+				"[%d:v]trim=start=%.6f:end=%.6f,setpts=PTS-STARTPTS,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1%s[%s]",
+				idx, clip.SourceInSec, clip.SourceOutSec, settings.Width, settings.Height, settings.Width, settings.Height, effectsSuffix, label,
 			)
 		}
 		filterParts = append(filterParts, videoFilter)
@@ -311,16 +346,25 @@ func Plan(proj *models.Project, settings models.ExportSettings) (*ExportPlan, er
 				opacity = 1.0
 			}
 
+			effectsChain, err := buildEffectsChain(clip.Effects)
+			if err != nil {
+				return nil, fmt.Errorf("clip %s: %w", clip.ID, err)
+			}
+			effectsSuffix := ""
+			if effectsChain != "" {
+				effectsSuffix = "," + effectsChain
+			}
+
 			var prep string
 			if asset.MediaType == models.MediaImage {
 				prep = fmt.Sprintf(
-					"[%d:v]scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1,loop=loop=-1:size=1,trim=duration=%.6f,setpts=PTS-STARTPTS+%.6f/TB,format=yuva420p,colorchannelmixer=aa=%.3f[%s]",
-					idx, settings.Width, settings.Height, settings.Width, settings.Height, clipDuration, clip.TimelineStartSec, opacity, overlayLabel,
+					"[%d:v]scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1,loop=loop=-1:size=1,trim=duration=%.6f,setpts=PTS-STARTPTS+%.6f/TB%s,format=yuva420p,colorchannelmixer=aa=%.3f[%s]",
+					idx, settings.Width, settings.Height, settings.Width, settings.Height, clipDuration, clip.TimelineStartSec, effectsSuffix, opacity, overlayLabel,
 				)
 			} else {
 				prep = fmt.Sprintf(
-					"[%d:v]trim=start=%.6f:end=%.6f,setpts=PTS-STARTPTS+%.6f/TB,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuva420p,colorchannelmixer=aa=%.3f[%s]",
-					idx, clip.SourceInSec, clip.SourceOutSec, clip.TimelineStartSec, settings.Width, settings.Height, settings.Width, settings.Height, opacity, overlayLabel,
+					"[%d:v]trim=start=%.6f:end=%.6f,setpts=PTS-STARTPTS+%.6f/TB,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1%s,format=yuva420p,colorchannelmixer=aa=%.3f[%s]",
+					idx, clip.SourceInSec, clip.SourceOutSec, clip.TimelineStartSec, settings.Width, settings.Height, settings.Width, settings.Height, effectsSuffix, opacity, overlayLabel,
 				)
 			}
 			filterParts = append(filterParts, prep)
@@ -347,6 +391,28 @@ func Plan(proj *models.Project, settings models.ExportSettings) (*ExportPlan, er
 			drawtextFilter, err := buildDrawtextFilter(tc, settings)
 			if err != nil {
 				return nil, fmt.Errorf("text clip %s: %w", tc.ID, err)
+			}
+			filterParts = append(filterParts, fmt.Sprintf(
+				"[%s]%s[%s]",
+				currentVideoLabel, drawtextFilter, nextVideoLabel,
+			))
+			currentVideoLabel = nextVideoLabel
+		}
+	}
+
+	// --- Subtitle layers: same drawtext mechanism as text layers, with
+	// fixed standard subtitle styling (see subtitleToTextClip) - drawn
+	// after (so visually on top of) regular text layers, since captions
+	// should never be obscured by a decorative title sitting at a
+	// similar position.
+	subtitleTracks := subtitleTracksSortedByOrder(proj)
+	for _, track := range subtitleTracks {
+		for _, sc := range sortedSubtitleClips(track) {
+			tc := subtitleToTextClip(sc)
+			nextVideoLabel := fmt.Sprintf("sub_%s", sanitizeLabel(sc.ID))
+			drawtextFilter, err := buildDrawtextFilter(tc, settings)
+			if err != nil {
+				return nil, fmt.Errorf("subtitle clip %s: %w", sc.ID, err)
 			}
 			filterParts = append(filterParts, fmt.Sprintf(
 				"[%s]%s[%s]",
@@ -589,6 +655,37 @@ func sanitizeLabel(id string) string {
 		}
 	}
 	return b.String()
+}
+
+// subtitleToTextClip adapts a SubtitleClip into a TextClip with
+// standard subtitle styling (bottom-center, white text, black outline,
+// no shadow) so it can be rendered through the same already-verified
+// buildDrawtextFilter logic used for full TextClips, rather than
+// duplicating the entire escaping/positioning/styling pipeline for a
+// second clip type. Subtitles intentionally don't expose font/size/
+// color customization in Phase 1 (see models.SubtitleClip's doc
+// comment) - if that changes later, this is the one place defaults
+// would need to become per-clip overrides instead.
+func subtitleToTextClip(sc models.SubtitleClip) models.TextClip {
+	return models.TextClip{
+		ID:               sc.ID,
+		TrackID:          sc.TrackID,
+		TimelineStartSec: sc.TimelineStartSec,
+		TimelineEndSec:   sc.TimelineEndSec,
+		Content:          sc.Content,
+		FontFamily:       "sans",
+		FontWeight:       "bold",
+		FontSize:         28,
+		Color:            "#ffffff",
+		PositionXPercent: 50,
+		PositionYPercent: 92, // lower than TextClip's lower-third default (85) - subtitles sit at the very bottom edge by convention
+		Alignment:        "center",
+		OutlineEnabled:   true,
+		OutlineColor:     "#000000",
+		OutlineWidth:     2,
+		ShadowEnabled:    false,
+		Opacity:          1,
+	}
 }
 
 // buildDrawtextFilter constructs one drawtext filter clause (without the
