@@ -19,7 +19,7 @@ export function useAudioSync(project: Project | null, playheadSec: number, isPla
     const neededAssetIds = new Set<string>();
     for (const track of project.tracks) {
       if (track.muted) continue;
-      for (const clip of track.clips) {
+      for (const clip of track.clips ?? []) {
         if (clip.muted) continue;
         neededAssetIds.add(clip.assetId);
       }
@@ -53,7 +53,7 @@ export function useAudioSync(project: Project | null, playheadSec: number, isPla
     const activeClipsByAsset = new Map<string, Clip>();
     for (const track of project.tracks) {
       if (track.muted) continue;
-      for (const clip of track.clips) {
+      for (const clip of track.clips ?? []) {
         if (clip.muted) continue;
         if (playheadSec >= clip.timelineStartSec && playheadSec < clip.timelineEndSec) {
           activeClipsByAsset.set(clip.assetId, clip);

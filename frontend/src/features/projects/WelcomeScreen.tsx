@@ -1,6 +1,8 @@
-import { useState } from "react";
-import { Film } from "lucide-react";
+import { useState, useEffect, useCallback } from "react";
+import { Film, FolderOpen, Clock, FolderInput } from "lucide-react";
 import { useEditorStore } from "../../stores/editorStore";
+import { createBackend } from "../../services";
+import type { RecentEntry } from "../../types/project";
 
 const PRESETS = [
   { label: "1080p · 30fps", width: 1920, height: 1080, fps: 30 },
@@ -11,18 +13,50 @@ const PRESETS = [
 
 export function WelcomeScreen() {
   const initNewProject = useEditorStore((s) => s.initNewProject);
+  const openProjectFrom = useEditorStore((s) => s.openProjectFrom);
   const isLoading = useEditorStore((s) => s.isLoading);
   const [name, setName] = useState("Untitled Project");
   const [presetIdx, setPresetIdx] = useState(0);
+  const [location, setLocation] = useState("");
+  const [defaultLocation, setDefaultLocation] = useState("");
+  const [recents, setRecents] = useState<RecentEntry[]>([]);
+  const [recentsLoading, setRecentsLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const backend = await createBackend();
+        const [dir, recentList] = await Promise.all([backend.getProjectsRootDir(), backend.recentProjects()]);
+        setDefaultLocation(dir);
+        setLocation(dir);
+        setRecents(recentList);
+      } catch {
+        /* non-fatal - the location field/recents list just stays empty */
+      } finally {
+        setRecentsLoading(false);
+      }
+    })();
+  }, []);
+
+  const handleBrowse = useCallback(async () => {
+    try {
+      const backend = await createBackend();
+      const dir = await backend.openDirectoryDialog();
+      if (dir) setLocation(dir);
+    } catch (e: any) {
+      useEditorStore.getState().setError(e.message || String(e));
+    }
+  }, []);
 
   const handleCreate = () => {
     const preset = PRESETS[presetIdx];
-    initNewProject(name.trim() || "Untitled Project", preset.width, preset.height, preset.fps);
+    const parentDir = location && location !== defaultLocation ? location : undefined;
+    initNewProject(name.trim() || "Untitled Project", preset.width, preset.height, preset.fps, parentDir);
   };
 
   return (
-    <div className="h-screen w-screen flex items-center justify-center bg-surface-0">
-      <div className="w-[380px] space-y-5">
+    <div className="h-screen w-screen flex items-center justify-center bg-surface-0 gap-10 px-6">
+      <div className="w-[380px] space-y-4">
         <div className="flex items-center gap-2 text-text-primary">
           <Film size={20} className="text-accent" />
           <span className="text-base font-semibold">New Project</span>
@@ -37,6 +71,29 @@ export function WelcomeScreen() {
             className="w-full px-3 py-2 rounded-md bg-surface-2 border border-border-subtle text-sm text-text-primary outline-none focus:ring-1 focus:ring-accent"
             autoFocus
           />
+        </div>
+
+        <div>
+          <label className="block text-[11px] text-text-tertiary mb-1.5">Save location</label>
+          <div className="flex gap-1.5">
+            <input
+              value={location}
+              onChange={(e) => setLocation(e.target.value)}
+              placeholder={defaultLocation}
+              className="flex-1 min-w-0 px-3 py-2 rounded-md bg-surface-2 border border-border-subtle text-xs text-text-primary font-mono-tabular outline-none focus:ring-1 focus:ring-accent truncate"
+              title={location}
+            />
+            <button
+              onClick={handleBrowse}
+              title="Choose folder"
+              className="shrink-0 px-2.5 rounded-md bg-surface-3 hover:bg-border-strong text-text-secondary hover:text-text-primary transition-colors"
+            >
+              <FolderInput size={14} />
+            </button>
+          </div>
+          {location && location !== defaultLocation && (
+            <p className="mt-1 text-[10px] text-accent">Saving here instead of the default Projects folder</p>
+          )}
         </div>
 
         <div>
@@ -65,6 +122,42 @@ export function WelcomeScreen() {
         >
           {isLoading ? "Creating..." : "Create Project"}
         </button>
+      </div>
+
+      <div className="w-px self-stretch max-h-[520px] bg-border-subtle" />
+
+      <div className="w-[320px] max-h-[520px] flex flex-col">
+        <span className="text-sm font-semibold text-text-primary mb-3">Recent Projects</span>
+        <div className="flex-1 overflow-y-auto space-y-1 -mx-1 px-1">
+          {recentsLoading && <div className="text-xs text-text-tertiary text-center py-8">Loading...</div>}
+
+          {!recentsLoading && recents.length === 0 && (
+            <div className="flex flex-col items-center justify-center text-center gap-2 text-text-tertiary text-xs py-10 px-3">
+              <FolderOpen size={20} />
+              <p>Projects you create or open will show up here.</p>
+            </div>
+          )}
+
+          {recents.map((entry) => (
+            <button
+              key={entry.projectDir}
+              onClick={() => openProjectFrom(entry.projectDir)}
+              className="w-full flex items-center gap-3 p-2.5 rounded-md hover:bg-surface-2 transition-colors text-left"
+            >
+              <div className="w-9 h-9 rounded bg-surface-2 flex items-center justify-center shrink-0">
+                <FolderOpen size={15} className="text-text-tertiary" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm text-text-primary truncate">{entry.name}</div>
+                <div className="text-[11px] text-text-tertiary truncate font-mono-tabular">{entry.projectDir}</div>
+              </div>
+              <div className="flex items-center gap-1 text-text-tertiary text-[11px] shrink-0">
+                <Clock size={10} />
+                {new Date(entry.lastOpened).toLocaleDateString()}
+              </div>
+            </button>
+          ))}
+        </div>
       </div>
     </div>
   );

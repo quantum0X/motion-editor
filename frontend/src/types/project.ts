@@ -43,6 +43,46 @@ export interface MediaAsset {
   importedAt: string; // ISO timestamp string (Go time.Time marshals to RFC3339)
 }
 
+export type EffectType =
+  | "blur"
+  | "sharpen"
+  | "brightness"
+  | "contrast"
+  | "saturation"
+  | "vignette"
+  | "grain"
+  | "vhs"
+  | "rgbshift";
+
+export interface Effect {
+  id: string;
+  type: EffectType;
+  params: Record<string, number>;
+  enabled: boolean;
+}
+
+export type TransitionType = "fade" | "dissolve" | "wipe" | "slide" | "push" | "zoom";
+export type InterpolationType = "linear" | "easeIn" | "easeOut" | "bezier";
+
+export interface Transition {
+  id: string;
+  type: TransitionType;
+  durationSec: number;
+  nextClipId: string;
+  direction: string; // "left" | "right" | "up" | "down"
+  easing: InterpolationType;
+}
+
+export type KeyframeProperty = "positionX" | "positionY" | "rotation" | "scale" | "opacity";
+
+export interface Keyframe {
+  id: string;
+  property: KeyframeProperty;
+  timeSec: number;
+  value: number;
+  interpolation: InterpolationType;
+}
+
 export interface Clip {
   id: string;
   assetId: string;
@@ -55,6 +95,9 @@ export interface Clip {
   opacity: number;
   volume: number;
   muted: boolean;
+  effects: Effect[];
+  keyframes: Keyframe[];
+  transition?: Transition | null;
 }
 
 export interface Track {
@@ -65,6 +108,7 @@ export interface Track {
   locked: boolean;
   hidden: boolean;
   muted: boolean;
+  height?: number; // per-track timeline lane height in px; undefined/0 = UI default
   clips: Clip[];
   textClips: TextClip[];
 }

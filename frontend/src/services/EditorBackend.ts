@@ -2,6 +2,8 @@ import type {
   Project,
   Clip,
   TextClip,
+  Effect,
+  Transition,
   ExportSettings,
   ExportProgress,
   RecentEntry,
@@ -27,10 +29,17 @@ import type {
  */
 export interface EditorBackend {
   // Project lifecycle
-  newProject(name: string, canvasWidth: number, canvasHeight: number, fps: number): Promise<Project>;
+  // parentDir is optional ("" or omitted = use the configured default
+  // Projects location) - lets a single project be created/saved somewhere
+  // else without changing the app-wide default.
+  newProject(name: string, canvasWidth: number, canvasHeight: number, fps: number, parentDir?: string): Promise<Project>;
   openProject(projectDir: string): Promise<Project>;
   saveProject(): Promise<Project>;
-  saveProjectAs(newName: string): Promise<Project>;
+  // Restores a full project snapshot as the backend's source of truth -
+  // used by undo/redo (see editorStore.ts). Does not touch the on-disk
+  // location; the normal save/autosave flow persists it later.
+  replaceProject(project: Project): Promise<Project>;
+  saveProjectAs(newName: string, parentDir?: string): Promise<Project>;
   autoSave(): Promise<void>;
   recentProjects(): Promise<RecentEntry[]>;
   getCurrentProject(): Promise<Project | null>;
@@ -55,6 +64,15 @@ export interface EditorBackend {
   updateTextClip(clipId: string, updated: TextClip): Promise<Project>;
   deleteTextClip(clipId: string): Promise<Project>;
   moveTextClip(clipId: string, newStartSec: number): Promise<Project>;
+
+  // Effects (color correction, filters, etc.) - stack on a video/image clip
+  addEffect(clipId: string, effect: Partial<Effect> & Pick<Effect, "type">): Promise<Project>;
+  updateEffect(clipId: string, effectId: string, updated: Effect): Promise<Project>;
+  removeEffect(clipId: string, effectId: string): Promise<Project>;
+
+  // Transitions - attached to the earlier of two adjacent clips on the same track
+  setTransition(clipId: string, transition: Partial<Transition> & Pick<Transition, "type" | "nextClipId">): Promise<Project>;
+  removeTransition(clipId: string): Promise<Project>;
 
   // Media import
   openFileDialog(): Promise<string[]>;

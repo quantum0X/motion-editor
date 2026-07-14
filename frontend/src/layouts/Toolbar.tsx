@@ -10,6 +10,10 @@ export function Toolbar({ onShowExport }: ToolbarProps) {
   const saveProject = useEditorStore((s) => s.saveProject);
   const lastError = useEditorStore((s) => s.lastError);
   const setError = useEditorStore((s) => s.setError);
+  const undo = useEditorStore((s) => s.undo);
+  const redo = useEditorStore((s) => s.redo);
+  const canUndo = useEditorStore((s) => s.canUndo);
+  const canRedo = useEditorStore((s) => s.canRedo);
 
   return (
     <div className="flex items-center gap-3 px-3 py-2 border-b border-border-subtle bg-surface-2 shrink-0">
@@ -17,12 +21,20 @@ export function Toolbar({ onShowExport }: ToolbarProps) {
 
       <div className="h-4 w-px bg-border-subtle" />
 
-      {/* Undo/redo are wired to a history stack in a later pass; shown
-          here disabled so the toolbar layout doesn't shift later. */}
-      <button disabled className="text-text-tertiary opacity-40" title="Undo (Ctrl+Z) — coming in a later phase">
+      <button
+        onClick={() => undo()}
+        disabled={!canUndo}
+        className="text-text-secondary hover:text-text-primary disabled:text-text-tertiary disabled:opacity-40 transition-colors"
+        title="Undo (Ctrl+Z)"
+      >
         <Undo2 size={15} />
       </button>
-      <button disabled className="text-text-tertiary opacity-40" title="Redo (Ctrl+Y) — coming in a later phase">
+      <button
+        onClick={() => redo()}
+        disabled={!canRedo}
+        className="text-text-secondary hover:text-text-primary disabled:text-text-tertiary disabled:opacity-40 transition-colors"
+        title="Redo (Ctrl+Y)"
+      >
         <Redo2 size={15} />
       </button>
 

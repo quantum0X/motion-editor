@@ -10,19 +10,22 @@ interface TimelineClipProps {
   pixelsPerSecond: number;
   fps: number;
   isSelected: boolean;
+  onDoubleClick?: () => void;
 }
 
 type DragMode = "move" | "trim-left" | "trim-right" | null;
 
 const SNAP_THRESHOLD_PX = 8;
 
-export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelected }: TimelineClipProps) {
+export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelected, onDoubleClick }: TimelineClipProps) {
   const selectClip = useEditorStore((s) => s.selectClip);
   const moveClip = useEditorStore((s) => s.moveClip);
   const trimClip = useEditorStore((s) => s.trimClip);
   const project = useEditorStore((s) => s.project);
+  const playheadSec = useEditorStore((s) => s.playheadSec);
 
   const [dragMode, setDragMode] = useState<DragMode>(null);
+  const [isSnapped, setIsSnapped] = useState(false);
   const dragStartRef = useRef<{ mouseX: number; clipStart: number; clipEnd: number } | null>(null);
   const [previewOffset, setPreviewOffset] = useState(0);
   // Mirrors previewOffset but updated synchronously inside the
@@ -40,22 +43,22 @@ export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelec
   const isVideo = track.type === "video";
   const baseColor = isVideo ? "bg-track-video-clip" : "bg-track-audio-clip";
 
-  /** Collects every other clip's start/end (in seconds) across all tracks, used for snap targets while dragging. */
+  /** Collects every other clip's start/end (in seconds) across all tracks, plus the playhead, used for snap targets while dragging. */
   const getSnapPoints = useCallback((): number[] => {
     if (!project) return [0];
-    const points = new Set<number>([0]);
+    const points = new Set<number>([0, playheadSec]);
     for (const t of project.tracks) {
-      for (const c of t.clips) {
+      for (const c of t.clips ?? []) {
         if (c.id === clip.id) continue;
         points.add(c.timelineStartSec);
         points.add(c.timelineEndSec);
       }
     }
     return Array.from(points);
-  }, [project, clip.id]);
+  }, [project, clip.id, playheadSec]);
 
   const snapTime = useCallback(
-    (timeSec: number): number => {
+    (timeSec: number): { time: number; snapped: boolean } => {
       const snapPoints = getSnapPoints();
       const thresholdSec = SNAP_THRESHOLD_PX / pixelsPerSecond;
       let closest = timeSec;
@@ -67,7 +70,7 @@ export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelec
           closestDist = dist;
         }
       }
-      return closest;
+      return { time: closest, snapped: closest !== timeSec };
     },
     [getSnapPoints, pixelsPerSecond]
   );
@@ -86,22 +89,25 @@ export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelec
 
         if (mode === "move") {
           const rawStart = dragStartRef.current.clipStart + deltaSec;
-          const snappedStart = snapTime(Math.max(0, rawStart));
+          const { time: snappedStart, snapped } = snapTime(Math.max(0, rawStart));
           const offset = snappedStart - dragStartRef.current.clipStart;
           liveOffsetRef.current = offset;
           setPreviewOffset(offset);
+          setIsSnapped(snapped);
         } else if (mode === "trim-left") {
           const rawStart = dragStartRef.current.clipStart + deltaSec;
-          const snappedStart = snapTime(Math.max(0, Math.min(rawStart, dragStartRef.current.clipEnd - 0.1)));
+          const { time: snappedStart, snapped } = snapTime(Math.max(0, Math.min(rawStart, dragStartRef.current.clipEnd - 0.1)));
           const offset = snappedStart - dragStartRef.current.clipStart;
           liveOffsetRef.current = offset;
           setPreviewOffset(offset);
+          setIsSnapped(snapped);
         } else if (mode === "trim-right") {
           const rawEnd = dragStartRef.current.clipEnd + deltaSec;
-          const snappedEnd = snapTime(Math.max(dragStartRef.current.clipStart + 0.1, rawEnd));
+          const { time: snappedEnd, snapped } = snapTime(Math.max(dragStartRef.current.clipStart + 0.1, rawEnd));
           const offset = snappedEnd - dragStartRef.current.clipEnd;
           liveOffsetRef.current = offset;
           setPreviewOffset(offset);
+          setIsSnapped(snapped);
         }
       };
 
@@ -125,6 +131,7 @@ export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelec
         liveOffsetRef.current = 0;
         setDragMode(null);
         setPreviewOffset(0);
+        setIsSnapped(false);
         dragStartRef.current = null;
       };
 
@@ -148,11 +155,15 @@ export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelec
   return (
     <div
       className={`absolute top-1 bottom-1 rounded-md overflow-hidden cursor-grab active:cursor-grabbing transition-shadow ${baseColor} ${
-        isSelected ? "ring-2 ring-accent" : "ring-1 ring-black/30"
+        dragMode && isSnapped ? "ring-2 ring-yellow-400" : isSelected ? "ring-2 ring-accent" : "ring-1 ring-black/30"
       }`}
       style={{ left: displayLeft, width: Math.max(displayWidth, 4) }}
       onMouseDown={(e) => handleMouseDown(e, "move")}
       onClick={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => {
+        e.stopPropagation();
+        onDoubleClick?.();
+      }}
       title={`${asset?.fileName ?? "Unknown"} — ${formatTimecode(clip.timelineStartSec, fps)} to ${formatTimecode(clip.timelineEndSec, fps)}`}
     >
       {/* Thumbnail strip background for video clips */}

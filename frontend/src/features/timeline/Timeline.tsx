@@ -1,9 +1,10 @@
 import { useRef, useCallback, useEffect, useState } from "react";
-import { ZoomIn, ZoomOut, Scissors, Copy, Trash2, Type } from "lucide-react";
+import { ZoomIn, ZoomOut, Scissors, Copy, Trash2, Type, Sparkles } from "lucide-react";
 import { useEditorStore, timelineDurationSec } from "../../stores/editorStore";
 import { TimeRuler } from "./TimeRuler";
 import { TimelineTrack } from "./TimelineTrack";
 import { TextClipPanel } from "./TextClipPanel";
+import { ClipEffectsPanel } from "./ClipEffectsPanel";
 
 export function Timeline() {
   const project = useEditorStore((s) => s.project);
@@ -18,10 +19,13 @@ export function Timeline() {
   const selectClip = useEditorStore((s) => s.selectClip);
   const ensureTextTrack = useEditorStore((s) => s.ensureTextTrack);
   const addTextClip = useEditorStore((s) => s.addTextClip);
+  const undo = useEditorStore((s) => s.undo);
+  const redo = useEditorStore((s) => s.redo);
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const [clipboardClipId, setClipboardClipId] = useState<string | null>(null);
   const [editingTextClipId, setEditingTextClipId] = useState<string | null>(null);
+  const [effectsClipId, setEffectsClipId] = useState<string | null>(null);
 
   const duration = timelineDurationSec(project);
   const totalWidth = Math.max(duration + 30, 60) * pixelsPerSecond + 200;
@@ -45,7 +49,14 @@ export function Timeline() {
           deleteSelectedClip();
         }
       } else if (e.ctrlKey || e.metaKey) {
-        if (e.key === "d" || e.key === "D") {
+        if (e.key === "z" || e.key === "Z") {
+          e.preventDefault();
+          if (e.shiftKey) redo();
+          else undo();
+        } else if (e.key === "y" || e.key === "Y") {
+          e.preventDefault();
+          redo();
+        } else if (e.key === "d" || e.key === "D") {
           if (selectedClipId) {
             e.preventDefault();
             duplicateSelectedClip();
@@ -71,7 +82,7 @@ export function Timeline() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [selectedClipId, playheadSec, clipboardClipId, splitClipAt, deleteSelectedClip, duplicateSelectedClip]);
+  }, [selectedClipId, playheadSec, clipboardClipId, splitClipAt, deleteSelectedClip, duplicateSelectedClip, undo, redo]);
 
   const handleSeek = useCallback((sec: number) => setPlayhead(sec), [setPlayhead]);
 
@@ -109,6 +120,11 @@ export function Timeline() {
   if (!project) {
     return <div className="flex-1 flex items-center justify-center text-text-tertiary text-sm">No project open</div>;
   }
+
+  const selectedVideoClipId =
+    selectedClipId && project.tracks.some((t) => t.type === "video" && (t.clips ?? []).some((c) => c.id === selectedClipId))
+      ? selectedClipId
+      : null;
 
   // Sort tracks for display: video tracks highest-order-first (so track
   // "Video 2" visually sits above "Video 1", matching its compositing
@@ -161,6 +177,16 @@ export function Timeline() {
           Add Text
         </button>
 
+        <button
+          onClick={() => selectedClipId && setEffectsClipId(selectedClipId)}
+          disabled={!selectedVideoClipId}
+          className="flex items-center gap-1.5 px-2 py-1 rounded text-text-secondary hover:text-text-primary hover:bg-surface-3 disabled:opacity-30 disabled:hover:bg-transparent transition-colors text-xs"
+          title="Effects: color correction, filters, transitions"
+        >
+          <Sparkles size={14} />
+          Effects
+        </button>
+
         <div className="flex-1" />
 
         <button onClick={() => setZoom(pixelsPerSecond / 1.4)} className="p-1.5 text-text-secondary hover:text-text-primary transition-colors" title="Zoom out">
@@ -186,6 +212,7 @@ export function Timeline() {
               project={project}
               pixelsPerSecond={pixelsPerSecond}
               totalWidth={totalWidth}
+              onEditClipEffects={setEffectsClipId}
             />
           ))}
           {textTracks.length > 0 && <div className="h-2 bg-surface-0" style={{ width: totalWidth + 144 }} />}
@@ -219,6 +246,7 @@ export function Timeline() {
       </div>
 
       {editingTextClipId && <TextClipPanel clipId={editingTextClipId} onClose={() => setEditingTextClipId(null)} />}
+      {effectsClipId && <ClipEffectsPanel clipId={effectsClipId} onClose={() => setEffectsClipId(null)} />}
     </div>
   );
 }

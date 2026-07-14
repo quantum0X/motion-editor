@@ -26,7 +26,7 @@ export function TextClipPanel({ clipId, onClose }: TextClipPanelProps) {
   const deleteSelectedTextClip = useEditorStore((s) => s.deleteSelectedTextClip);
   const selectTextClip = useEditorStore((s) => s.selectTextClip);
 
-  const clip = project?.tracks.flatMap((t) => t.textClips).find((c) => c.id === clipId);
+  const clip = project?.tracks.flatMap((t) => t.textClips ?? []).find((c) => c.id === clipId);
   const [draft, setDraft] = useState<TextClip | null>(clip ?? null);
 
   useEffect(() => {

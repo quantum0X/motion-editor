@@ -109,6 +109,8 @@ export function MediaLibrary() {
 }
 
 function MediaCard({ asset }: { asset: MediaAsset }) {
+  const addAssetAtPlayhead = useEditorStore((s) => s.addAssetAtPlayhead);
+
   const handleDragStart = (e: React.DragEvent) => {
     e.dataTransfer.setData("application/x-media-asset-id", asset.id);
     e.dataTransfer.effectAllowed = "copy";
@@ -120,8 +122,9 @@ function MediaCard({ asset }: { asset: MediaAsset }) {
     <div
       draggable
       onDragStart={handleDragStart}
+      onDoubleClick={() => addAssetAtPlayhead(asset.id)}
       className="group rounded-md overflow-hidden bg-surface-2 hover:bg-surface-3 cursor-grab active:cursor-grabbing transition-colors"
-      title={asset.fileName}
+      title={`${asset.fileName} — double-click to add at the playhead, or drag onto the timeline`}
     >
       <div className="relative aspect-video bg-surface-0 flex items-center justify-center overflow-hidden">
         {asset.thumbnailPath ? (

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback } from "react";
-import type { Project, Clip, Track, TextClip } from "../../types/project";
+import type { Project, Clip, Track, TextClip, Effect } from "../../types/project";
 
 /**
  * useCompositor drives a <canvas> preview by:
@@ -53,7 +53,7 @@ export function useCompositor(
     const neededAssetIds = new Set<string>();
     for (const track of project.tracks) {
       if (track.type !== "video") continue;
-      for (const clip of track.clips) neededAssetIds.add(clip.assetId);
+      for (const clip of track.clips ?? []) neededAssetIds.add(clip.assetId);
     }
 
     const assetsById = new Map(project.assets.map((a) => [a.id, a]));
@@ -125,7 +125,7 @@ export function useCompositor(
   }, [isPlaying]);
 
   const findActiveClip = useCallback((track: Track, atSec: number): Clip | null => {
-    for (const clip of track.clips) {
+    for (const clip of track.clips ?? []) {
       if (atSec >= clip.timelineStartSec && atSec < clip.timelineEndSec) return clip;
     }
     return null;
@@ -166,6 +166,7 @@ export function useCompositor(
 
       const opacity = clip.opacity ?? 1;
       ctx.globalAlpha = opacity;
+      ctx.filter = buildCanvasFilter(clip.effects ?? []);
 
       if (asset.mediaType === "video") {
         const entry = videoElementsRef.current.get(asset.id);
@@ -208,6 +209,7 @@ export function useCompositor(
       }
 
       ctx.globalAlpha = 1;
+      ctx.filter = "none";
     }
 
     // Text layers - always drawn above every video track, matching the
@@ -216,7 +218,7 @@ export function useCompositor(
     // format normalization.
     const textTracks = project.tracks.filter((t) => t.type === "text" && !t.hidden).sort((a, b) => a.order - b.order);
     for (const track of textTracks) {
-      for (const tc of track.textClips) {
+      for (const tc of track.textClips ?? []) {
         if (playheadSec < tc.timelineStartSec || playheadSec >= tc.timelineEndSec) continue;
         drawTextClip(ctx, tc, canvas.width, canvas.height);
       }
@@ -231,6 +233,57 @@ export function useCompositor(
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     };
   }, [drawFrame]);
+}
+
+/**
+ * Maps a clip's Effects stack to a CSS filter string for Canvas 2D's
+ * ctx.filter, so the Effects panel's sliders visibly change the preview
+ * in real time.
+ *
+ * Canvas 2D's filter only supports the same primitives as CSS filters
+ * (blur/brightness/contrast/saturate/hue-rotate/etc.) - there's no
+ * canvas-native vignette, grain, or RGB-channel-shift filter. For those
+ * three, this is intentionally a no-op here (the effect is still saved
+ * on the clip and will apply at export time via backend/export/builder.go,
+ * it just isn't previewed pixel-for-pixel in the canvas yet). Sharpen
+ * and vhs get a rough visual approximation using the filters that ARE
+ * available, since "some directionally-correct feedback while dragging
+ * the slider" is more useful here than nothing at all.
+ */
+function buildCanvasFilter(effects: Effect[]): string {
+  const parts: string[] = [];
+  for (const effect of effects) {
+    if (!effect.enabled) continue;
+    const amount = effect.params?.amount ?? 0;
+    switch (effect.type) {
+      case "brightness":
+        parts.push(`brightness(${Math.max(0, 1 + amount / 100)})`);
+        break;
+      case "contrast":
+        parts.push(`contrast(${Math.max(0, 1 + amount / 100)})`);
+        break;
+      case "saturation":
+        parts.push(`saturate(${Math.max(0, 1 + amount / 100)})`);
+        break;
+      case "blur": {
+        const radius = effect.params?.radiusPx ?? 0;
+        if (radius > 0) parts.push(`blur(${radius}px)`);
+        break;
+      }
+      case "sharpen":
+        // Rough stand-in: a mild contrast boost reads as "crisper" at a
+        // glance even though it isn't a true unsharp mask.
+        parts.push(`contrast(${1 + amount / 200})`);
+        break;
+      case "vhs":
+        parts.push(`saturate(${Math.max(0, 1 - amount / 300)}) contrast(${1 + amount / 400})`);
+        break;
+      // vignette / grain / rgbshift: no canvas-filter equivalent, see doc comment above.
+      default:
+        break;
+    }
+  }
+  return parts.length > 0 ? parts.join(" ") : "none";
 }
 
 /**

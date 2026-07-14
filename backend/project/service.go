@@ -196,7 +196,16 @@ func projectSubdirs() []string {
 // initializes an empty Project model with one video and one audio track
 // (a sensible default so the timeline isn't empty on first open), saves
 // it, and makes it the currently open project.
-func (s *Service) NewProject(name string, canvasWidth, canvasHeight int, fps float64) (*models.Project, error) {
+//
+// parentDir optionally overrides where the project folder is created -
+// pass "" to use the configured default (s.RootDir, i.e. Settings >
+// Projects Location). Passing an explicit directory lets a single
+// project be saved somewhere other than the default projects folder
+// (e.g. a specific Dropbox subfolder, an external drive, a client's
+// folder) without changing the app-wide default for every future
+// project - this is a one-off "Save this project at..." choice, not a
+// persistent setting.
+func (s *Service) NewProject(name string, canvasWidth, canvasHeight int, fps float64, parentDir string) (*models.Project, error) {
 	if name == "" {
 		return nil, fmt.Errorf("project name cannot be empty")
 	}
@@ -207,7 +216,7 @@ func (s *Service) NewProject(name string, canvasWidth, canvasHeight int, fps flo
 		fps = 30
 	}
 
-	dir, err := s.uniqueProjectDir(name)
+	dir, err := s.uniqueProjectDir(name, parentDir)
 	if err != nil {
 		return nil, err
 	}
@@ -229,8 +238,9 @@ func (s *Service) NewProject(name string, canvasWidth, canvasHeight int, fps flo
 		CanvasHeight:  canvasHeight,
 		FPS:           fps,
 		Tracks: []models.Track{
-			{ID: uuid.NewString(), Type: models.TrackVideo, Name: "Video 1", Order: 0, Clips: []models.Clip{}},
-			{ID: uuid.NewString(), Type: models.TrackAudio, Name: "Audio 1", Order: 0, Clips: []models.Clip{}},
+			{ID: uuid.NewString(), Type: models.TrackVideo, Name: "Video 2", Order: 1, Clips: []models.Clip{}, TextClips: []models.TextClip{}, SubtitleClips: []models.SubtitleClip{}},
+			{ID: uuid.NewString(), Type: models.TrackVideo, Name: "Video 1", Order: 0, Clips: []models.Clip{}, TextClips: []models.TextClip{}, SubtitleClips: []models.SubtitleClip{}},
+			{ID: uuid.NewString(), Type: models.TrackAudio, Name: "Audio 1", Order: 0, Clips: []models.Clip{}, TextClips: []models.TextClip{}, SubtitleClips: []models.SubtitleClip{}},
 		},
 		Assets: []models.MediaAsset{},
 	}
@@ -250,11 +260,16 @@ func (s *Service) NewProject(name string, canvasWidth, canvasHeight int, fps flo
 	return proj, nil
 }
 
-// uniqueProjectDir returns Projects/<name>, appending " (2)", " (3)", etc.
-// if a folder with that name already exists, so NewProject never silently
-// overwrites an existing project folder.
-func (s *Service) uniqueProjectDir(name string) (string, error) {
-	base := filepath.Join(s.RootDir, sanitizeFolderName(name))
+// uniqueProjectDir returns <parentDir-or-RootDir>/<name>, appending " (2)",
+// " (3)", etc. if a folder with that name already exists, so NewProject
+// never silently overwrites an existing project folder. An empty
+// parentDir falls back to the service's configured default root.
+func (s *Service) uniqueProjectDir(name, parentDir string) (string, error) {
+	root := s.RootDir
+	if parentDir != "" {
+		root = parentDir
+	}
+	base := filepath.Join(root, sanitizeFolderName(name))
 	candidate := base
 	for i := 2; ; i++ {
 		if _, err := os.Stat(candidate); os.IsNotExist(err) {
@@ -318,15 +333,38 @@ func (s *Service) SaveProject() (*models.Project, error) {
 	return s.current, nil
 }
 
+// ReplaceProject swaps the in-memory current project for the given
+// snapshot, keeping the same on-disk project directory. It does not
+// write to disk itself - the existing autosave timer / explicit Save
+// picks up the new state on its normal schedule, same as any other
+// in-memory mutation (AddClipToTrack, MoveClip, etc.).
+//
+// This exists to support undo/redo: the frontend keeps its own stack of
+// full project snapshots (see frontend/src/stores/editorStore.ts) and
+// calls this to make the backend's source of truth match whichever
+// snapshot the user has undone/redone to, rather than the backend
+// needing its own parallel undo stack.
+func (s *Service) ReplaceProject(proj *models.Project) (*models.Project, error) {
+	if s.current == nil || s.currentDir == "" {
+		return nil, fmt.Errorf("no project is currently open")
+	}
+	if proj == nil {
+		return nil, fmt.Errorf("project snapshot cannot be nil")
+	}
+	proj.ModifiedAt = time.Now()
+	s.current = proj
+	return s.current, nil
+}
+
 // SaveProjectAs copies the current project to a new project folder under
 // a new name, switches the current project to that new copy, and saves
 // it. The original project on disk is left untouched.
-func (s *Service) SaveProjectAs(newName string) (*models.Project, error) {
+func (s *Service) SaveProjectAs(newName, parentDir string) (*models.Project, error) {
 	if s.current == nil {
 		return nil, fmt.Errorf("no project is currently open")
 	}
 
-	newDir, err := s.uniqueProjectDir(newName)
+	newDir, err := s.uniqueProjectDir(newName, parentDir)
 	if err != nil {
 		return nil, err
 	}

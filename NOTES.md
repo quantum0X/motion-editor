@@ -343,3 +343,181 @@ canvas preview also does not render any of these four yet.
    clip boundaries, a keyframe timeline with draggable markers).
 4. Add canvas preview support for effects/keyframes so preview matches
    export, the same property maintained for every other feature so far.
+
+---
+
+## Session N+1: bug fixes + new-project location/recents + effects UI + resizable panels
+
+### The actual root cause of "Add Text → black screen" and (probably) some of the preview-not-rendering reports
+Found it, and it's a real, reproducible bug, not a guess:
+
+`models.Track` has `TextClips []TextClip` and `SubtitleClips []SubtitleClip`
+fields with no `omitempty`. `NewProject`'s default Video 1/Video 2/Audio 1
+tracks only ever set `Clips`, leaving `TextClips`/`SubtitleClips` at Go's
+zero value for a slice — `nil`. `encoding/json` marshals a nil slice as
+JSON `null`, not `[]`, regardless of the `omitempty` tag (which only
+suppresses the *key*, not this). The frontend types every track's
+`textClips` as `TextClip[]` and calls array methods on it unconditionally
+— e.g. `TextClipPanel.tsx`'s `project.tracks.flatMap(t => t.textClips)`,
+or `useCompositor.ts`'s `for (const tc of track.textClips)`. Receiving
+`null` for any video/audio track throws a TypeError deep in a render or
+animation-frame callback. There was **no error boundary anywhere in the
+app** (checked `main.tsx`/`App.tsx`), so React's default behavior on an
+uncaught render error is to unmount the entire tree — leaving
+`index.css`'s `#0d0d10` page background showing through. That's the
+"black screen." Since `useCompositor`'s render loop hits this same
+`track.textClips` access every frame, this is also a very plausible
+explanation for at least some "preview not rendering" reports — one bad
+frame throws, unmounts the player along with everything else, and
+playback just stops looking like it's rendering at all.
+
+Fixed at the source: `Track` and `Clip` (the same class of bug applies to
+`Clip.Effects`/`Keyframes`) now have a custom `MarshalJSON` that
+normalizes nil slices to `[]` before serializing — see the doc comments
+in `backend/models/models.go`. This is a more durable fix than patching
+every `Track{}`/`Clip{}` construction site, since it also covers sites
+added later. Also added explicit `TextClips: []models.TextClip{}` etc.
+at the two spots that construct tracks/clips today, and added
+`?? []` defensive fallbacks at every frontend call site that iterates
+`track.clips`/`track.textClips` (`useCompositor.ts`, `useAudioSync.ts`,
+`TextClipPanel.tsx`, `TimelineTrack.tsx`) so this class of bug can't
+silently reappear from a future backend field.
+
+**Also added: a real error boundary.** `src/components/ErrorBoundary.tsx`
+wraps the whole app (`main.tsx`) with a "Something went wrong" recovery
+screen instead of an unmount-to-black. `src/components/PanelErrorBoundary.tsx`
+additionally wraps the media library, player, and timeline panels
+individually in `EditorLayout.tsx`, so a crash in one panel (e.g. a bad
+timeline render) doesn't take the still-working preview down with it.
+This is a general resilience fix, not just a patch for the one bug above
+— it's the difference between "black screen, restart the app" and "one
+panel shows an error, click Try Again" for *any* future uncaught
+exception anywhere in the tree.
+
+### Undo/redo: actually implemented (was previously just disabled buttons)
+`Toolbar.tsx`/`MenuBar.tsx` had `<button disabled>` placeholders for
+Undo/Redo with a comment saying "wired to a history stack in a later
+pass" — there was no history stack; it hadn't been started. Implemented
+via a client-side full-project-snapshot stack in `editorStore.ts`
+(`history: { past, future }`, capped at 100 entries) — every mutating
+store action pushes the pre-mutation project onto `past` and clears
+`future` on success. `undo`/`redo` pop/push between the stacks and call
+a new backend method, `ReplaceProject`, to keep the Go side's in-memory
+`current` project in sync with whichever snapshot the user landed on
+(added `Service.ReplaceProject` / `App.ReplaceProject` — in-memory only,
+doesn't touch disk itself, the existing autosave/save flow persists it
+same as any other mutation). Wired to Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z in
+`Timeline.tsx`'s existing keydown handler, and to the Toolbar/MenuBar
+buttons (now enabled, using `canUndo`/`canRedo` derived from stack
+length). Not done: coalescing rapid-fire changes (e.g. dragging an
+effect slider currently pushes one history entry per onChange tick,
+same as every other action) — mentioned inline in the store as a known
+rough edge, not a correctness bug.
+
+### New Project / Welcome screen: save location + Recent Projects panel
+Matches the requested layout (location field on the left form, recent
+projects list on the right). Backend already had `OpenDirectoryDialog`,
+`GetProjectsRootDir`, and `RecentProjects` bound from a previous session
+— just needed wiring up. Added an optional `parentDir` parameter to
+`NewProject` and `SaveProjectAs` (both Go and the frontend contract) so
+a single project can be created/saved somewhere other than the
+app-default Projects folder without changing that default for future
+projects. `NewProjectModal.tsx` (in-app "File > New Project") and
+`WelcomeScreen.tsx` (first-launch, no project open yet) both got this
+treatment. `mockBackend.ts` now keeps a real (localStorage-backed)
+recent-projects list instead of always returning a single fake entry, so
+the Recent Projects panel has something real to click through in the
+browser dev target.
+
+### Effects (color correction, filters) — new, both backend contract wiring and frontend UI
+The Go backend already had full `AddEffect`/`UpdateEffect`/`RemoveEffect`
+and `SetTransition`/`RemoveTransition` bound methods from a previous
+session, but **zero frontend existed for any of it** — no types, no
+`EditorBackend` methods, no UI. Added:
+- `Effect`/`Transition`/`Keyframe` types to `types/project.ts`, matching
+  the Go models (`Clip.effects`/`keyframes`/`transition` fields added).
+- The corresponding methods on `EditorBackend`, `wailsBackend.ts`, and
+  `mockBackend.ts`.
+- `ClipEffectsPanel.tsx` — a panel (opened via the new "Effects" toolbar
+  button in the timeline, enabled when a video-track clip is selected,
+  or by double-clicking a video clip) with three sections: Color
+  Correction (brightness/contrast/saturation sliders, always present,
+  add/update the underlying Effect lazily), Filters (blur, sharpen,
+  vignette, grain, VHS, RGB shift — click to add, then a slider +
+  remove button per active one), and Transition (dropdown of
+  fade/dissolve/wipe/slide/push/zoom + duration, targeting whichever
+  clip starts right after this one on the same track).
+- Canvas preview now actually reflects color-correction/blur/sharpen/vhs
+  effects live via `ctx.filter` in `useCompositor.ts` (ffmpeg-equivalent
+  values are computed the same way at export time by the existing
+  `backend/export/effects.go`, so preview and export agree for
+  everything Canvas 2D's filter primitive can express — vignette, grain,
+  and RGB-shift don't have a canvas-filter equivalent, so those three
+  are export-only for now; documented in code).
+
+**Known limitation, stated honestly rather than glossed over**:
+transitions are now fully editable and persist on the project (data
+model + UI complete), but **rendering a transition into the final
+exported video is still not wired into `backend/export/builder.go`** —
+same gap the previous session's notes already flagged for
+transitions/keyframes generally. Doing that safely means deciding how
+`Plan()`'s per-track concat chain changes when adjacent clips overlap
+during a transition's duration, which is nontrivial to get right without
+an environment to actually render and inspect output video, so I didn't
+attempt it blind in this pass. The UI says exactly this in a small note
+under the transition picker, so nobody is surprised when they export
+and the cut is still hard.
+
+### Snap-to-clip dragging
+This one turned out to already exist (`TimelineClip.tsx` already had an
+8px-threshold snap-to-clip-edges implementation, added in a previous
+session) and already behaves the way the request asked for — it only
+snaps within a small pixel threshold, so an intentional gap (dragging
+well clear of any edge) is untouched, and it doesn't fight the user by
+force-closing gaps. Enhanced it: the playhead position is now also a
+snap target (a common editor feature that was missing), and dragging a
+clip onto a snap point now shows a brief yellow ring on the clip as
+visual feedback that a snap occurred, instead of the snap being
+invisible until you let go.
+
+### New media placed at the playhead, not always at time 0
+`MediaLibrary.tsx` only supported drag-and-drop onto the timeline
+before (which already places at the drop position, so nothing to fix
+there). Added double-click on a media card as a second way to add it,
+via a new `addAssetAtPlayhead` store action that places the clip at the
+current playhead on the first compatible track (matching video/audio
+type) that has room at that position, falling back to the first
+compatible track (surfacing a clear error if none exists) rather than
+silently overlapping something.
+
+### Resizable panels
+`EditorLayout.tsx` now has draggable dividers (a small local
+`ResizeHandle` component, no new dependency) between the media library
+and the preview, and between that row and the timeline; both sizes
+persist across reloads via `localStorage`. Each timeline track also got
+its own vertical resize handle (`TimelineTrack.tsx`, drag the thin strip
+at the bottom of a track's lane) — height is stored per-track
+(`Track.height`, added to both the Go model and the frontend type) but
+is currently a client-side-only preference (doesn't round-trip through
+`ReplaceProject`/save yet) since persisting UI-only layout preferences
+into the saved project format felt like a separate decision to make
+deliberately rather than as a side effect of this pass.
+
+### Still not done / explicitly out of scope this pass
+- Transition rendering in the actual export output (see above).
+- A real multi-select / multi-track "choose which track(s)" UI beyond
+  what already exists (drag onto a specific lane, or the effects
+  panel's "next clip on this track" dropdown for transitions) — the
+  request's "choose multiple timeline or track like video1 track,
+  video track2 or audio track" is covered by the existing drag-to-lane
+  model plus the transition/track UI added here, but there's no
+  dedicated track-multi-select widget beyond that.
+- Track lock/hide/mute buttons in `TimelineTrack.tsx` are still visual
+  only (no backend toggle exists) — pre-existing gap, not something this
+  request asked to fix, left alone rather than scope-creeping into it.
+- Full verification against the real Wails/ffmpeg backend (no `wails
+  dev` environment available in this pass) — verified via `go build`,
+  `go vet`, `tsc --noEmit`, `npm run build`, and `eslint`, all clean, and
+  the mock backend exercises every new code path end-to-end, but real
+  desktop-app manual testing is still the next actual step, same as the
+  previous session's notes already said.

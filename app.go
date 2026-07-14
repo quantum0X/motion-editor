@@ -84,8 +84,11 @@ func (a *App) startup(ctx context.Context) {
 
 // --- Project lifecycle (bound methods) ---
 
-func (a *App) NewProject(name string, canvasWidth, canvasHeight int, fps float64) (*models.Project, error) {
-	return a.projectSvc.NewProject(name, canvasWidth, canvasHeight, fps)
+// parentDir is optional (pass "" to use the configured default Projects
+// location) - lets a single project be created somewhere other than the
+// app-wide default, chosen via OpenDirectoryDialog in the New Project UI.
+func (a *App) NewProject(name string, canvasWidth, canvasHeight int, fps float64, parentDir string) (*models.Project, error) {
+	return a.projectSvc.NewProject(name, canvasWidth, canvasHeight, fps, parentDir)
 }
 
 func (a *App) OpenProject(projectDir string) (*models.Project, error) {
@@ -96,8 +99,15 @@ func (a *App) SaveProject() (*models.Project, error) {
 	return a.projectSvc.SaveProject()
 }
 
-func (a *App) SaveProjectAs(newName string) (*models.Project, error) {
-	return a.projectSvc.SaveProjectAs(newName)
+// ReplaceProject backs undo/redo - see Service.ReplaceProject doc comment.
+func (a *App) ReplaceProject(proj *models.Project) (*models.Project, error) {
+	return a.projectSvc.ReplaceProject(proj)
+}
+
+// parentDir is optional (pass "" to save alongside the app's default
+// Projects location).
+func (a *App) SaveProjectAs(newName, parentDir string) (*models.Project, error) {
+	return a.projectSvc.SaveProjectAs(newName, parentDir)
 }
 
 func (a *App) AutoSave() error {

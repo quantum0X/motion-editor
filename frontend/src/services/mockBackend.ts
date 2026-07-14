@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from "uuid";
 import type { EditorBackend } from "./EditorBackend";
-import type { Project, Clip, TextClip, Track, MediaAsset, ExportProgress, AppSettings } from "../types/project";
+import type { Project, Clip, TextClip, Track, MediaAsset, Effect, Transition, ExportProgress, AppSettings, RecentEntry } from "../types/project";
 
 /**
  * In-browser mock of the Go backend. Mirrors the validation/mutation
@@ -31,6 +31,57 @@ function makeEmptyProject(name: string, w = 1920, h = 1080, fps = 30): Project {
     ],
     assets: [],
   };
+}
+
+const RECENTS_KEY = "mock-recent-projects";
+
+function loadRecents(): RecentEntry[] {
+  try {
+    const raw = window.localStorage?.getItem(RECENTS_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {
+    /* ignore - dev convenience only */
+  }
+  return [];
+}
+
+function saveRecents(list: RecentEntry[]) {
+  try {
+    window.localStorage?.setItem(RECENTS_KEY, JSON.stringify(list.slice(0, 10)));
+  } catch {
+    /* ignore - dev convenience only */
+  }
+}
+
+function touchRecent(dir: string, name: string) {
+  const list = loadRecents().filter((r) => r.projectDir !== dir);
+  list.unshift({ projectDir: dir, name, lastOpened: new Date().toISOString() });
+  saveRecents(list);
+}
+
+function defaultEffectParams(type: Effect["type"]): Record<string, number> {
+  switch (type) {
+    case "brightness":
+      return { amount: 0 }; // -100..100
+    case "contrast":
+      return { amount: 0 }; // -100..100
+    case "saturation":
+      return { amount: 0 }; // -100..100
+    case "blur":
+      return { radiusPx: 4 };
+    case "sharpen":
+      return { amount: 50 };
+    case "vignette":
+      return { amount: 50 };
+    case "grain":
+      return { amount: 20 };
+    case "vhs":
+      return { amount: 50 };
+    case "rgbshift":
+      return { amount: 5 };
+    default:
+      return {};
+  }
 }
 
 export function createMockBackend(): EditorBackend {
@@ -72,8 +123,9 @@ export function createMockBackend(): EditorBackend {
   }
 
   return {
-    async newProject(name, w, h, fps) {
+    async newProject(name, w, h, fps, parentDir) {
       project = makeEmptyProject(name, w, h, fps);
+      touchRecent((parentDir || mockSettings.projectsRootDir) + "/" + name, name);
       return structuredClone(project);
     },
 
@@ -81,6 +133,7 @@ export function createMockBackend(): EditorBackend {
       // Mock has nothing real to open; return the in-memory project as-is
       // so UI flows (recent projects list, open dialog) can still be
       // exercised end-to-end in the browser.
+      touchRecent(_dir, project.name);
       return structuredClone(project);
     },
 
@@ -89,8 +142,15 @@ export function createMockBackend(): EditorBackend {
       return structuredClone(project);
     },
 
-    async saveProjectAs(newName) {
+    async replaceProject(snapshot) {
+      project = structuredClone(snapshot);
+      project.modifiedAt = new Date().toISOString();
+      return structuredClone(project);
+    },
+
+    async saveProjectAs(newName, parentDir) {
       project = { ...structuredClone(project), id: uuidv4(), name: newName };
+      touchRecent((parentDir || mockSettings.projectsRootDir) + "/" + newName, newName);
       return structuredClone(project);
     },
 
@@ -99,7 +159,11 @@ export function createMockBackend(): EditorBackend {
     },
 
     async recentProjects() {
-      return [{ projectDir: "/mock/Projects/" + project.name, name: project.name, lastOpened: new Date().toISOString() }];
+      const list = loadRecents();
+      if (list.length === 0) {
+        return [{ projectDir: mockSettings.projectsRootDir + "/" + project.name, name: project.name, lastOpened: new Date().toISOString() }];
+      }
+      return list;
     },
 
     async getCurrentProject() {
@@ -154,6 +218,9 @@ export function createMockBackend(): EditorBackend {
         opacity: clipInput.opacity ?? 1,
         volume: clipInput.volume ?? 1,
         muted: clipInput.muted ?? false,
+        effects: [],
+        keyframes: [],
+        transition: null,
       };
 
       for (const existing of track.clips) {
@@ -338,6 +405,57 @@ export function createMockBackend(): EditorBackend {
       const duration = clip.timelineEndSec - clip.timelineStartSec;
       clip.timelineStartSec = newStartSec;
       clip.timelineEndSec = newStartSec + duration;
+      return structuredClone(project);
+    },
+
+    async addEffect(clipId, effect) {
+      const found = findClip(clipId);
+      if (!found) throw new Error(`Clip ${clipId} not found`);
+      const newEffect: Effect = {
+        id: uuidv4(),
+        type: effect.type,
+        params: effect.params ?? defaultEffectParams(effect.type),
+        enabled: effect.enabled ?? true,
+      };
+      found.clip.effects = [...(found.clip.effects ?? []), newEffect];
+      return structuredClone(project);
+    },
+
+    async updateEffect(clipId, effectId, updated) {
+      const found = findClip(clipId);
+      if (!found) throw new Error(`Clip ${clipId} not found`);
+      const idx = (found.clip.effects ?? []).findIndex((e) => e.id === effectId);
+      if (idx < 0) throw new Error(`Effect ${effectId} not found on clip ${clipId}`);
+      found.clip.effects[idx] = { ...updated, id: effectId };
+      return structuredClone(project);
+    },
+
+    async removeEffect(clipId, effectId) {
+      const found = findClip(clipId);
+      if (!found) throw new Error(`Clip ${clipId} not found`);
+      found.clip.effects = (found.clip.effects ?? []).filter((e) => e.id !== effectId);
+      return structuredClone(project);
+    },
+
+    async setTransition(clipId, transition) {
+      const found = findClip(clipId);
+      if (!found) throw new Error(`Clip ${clipId} not found`);
+      const newTransition: Transition = {
+        id: uuidv4(),
+        type: transition.type,
+        durationSec: transition.durationSec ?? 1,
+        nextClipId: transition.nextClipId,
+        direction: transition.direction || "left",
+        easing: transition.easing || "linear",
+      };
+      found.clip.transition = newTransition;
+      return structuredClone(project);
+    },
+
+    async removeTransition(clipId) {
+      const found = findClip(clipId);
+      if (!found) throw new Error(`Clip ${clipId} not found`);
+      found.clip.transition = null;
       return structuredClone(project);
     },
 

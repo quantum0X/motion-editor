@@ -36,6 +36,10 @@ export function MenuBar({ onShowExport, onShowSettings, onShowNewProject, onShow
   const duplicateSelectedClip = useEditorStore((s) => s.duplicateSelectedClip);
   const setZoom = useEditorStore((s) => s.setZoom);
   const pixelsPerSecond = useEditorStore((s) => s.pixelsPerSecond);
+  const undo = useEditorStore((s) => s.undo);
+  const redo = useEditorStore((s) => s.redo);
+  const canUndo = useEditorStore((s) => s.canUndo);
+  const canRedo = useEditorStore((s) => s.canRedo);
 
   const handleOpen = useCallback((menu: string) => setOpenMenu(menu), []);
   const handleClose = useCallback(() => setOpenMenu(null), []);
@@ -45,7 +49,11 @@ export function MenuBar({ onShowExport, onShowSettings, onShowNewProject, onShow
     if (!name) return;
     try {
       const backend = await createBackend();
-      const updated = await backend.saveProjectAs(name);
+      let parentDir: string | undefined;
+      if (window.confirm("Choose a custom save location for this copy? (Cancel keeps the default Projects folder.)")) {
+        parentDir = await backend.openDirectoryDialog();
+      }
+      const updated = await backend.saveProjectAs(name, parentDir);
       useEditorStore.getState().setProject(updated);
     } catch (e: any) {
       useEditorStore.getState().setError(e.message || String(e));
@@ -80,8 +88,8 @@ export function MenuBar({ onShowExport, onShowSettings, onShowNewProject, onShow
   ];
 
   const editMenu: MenuItemDef[] = [
-    { label: "Undo", shortcut: "Ctrl+Z", disabled: true },
-    { label: "Redo", shortcut: "Ctrl+Y", disabled: true },
+    { label: "Undo", shortcut: "Ctrl+Z", disabled: !canUndo, onClick: () => undo() },
+    { label: "Redo", shortcut: "Ctrl+Y", disabled: !canRedo, onClick: () => redo() },
     { divider: true, label: "" },
     {
       label: "Split at Playhead",

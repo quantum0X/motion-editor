@@ -1,5 +1,5 @@
 import type { EditorBackend } from "./EditorBackend";
-import type { Project, Clip, TextClip, ExportSettings, ExportProgress, AppSettings } from "../types/project";
+import type { Project, Clip, TextClip, Effect, Transition, ExportSettings, ExportProgress, AppSettings } from "../types/project";
 
 // Wails injects a `window.go.main.App.<MethodName>` function for every
 // bound method on the Go App struct, plus `window.runtime.EventsOn` for
@@ -11,10 +11,11 @@ declare global {
     go: {
       main: {
         App: {
-          NewProject(name: string, w: number, h: number, fps: number): Promise<Project>;
+          NewProject(name: string, w: number, h: number, fps: number, parentDir: string): Promise<Project>;
           OpenProject(dir: string): Promise<Project>;
           SaveProject(): Promise<Project>;
-          SaveProjectAs(name: string): Promise<Project>;
+          ReplaceProject(project: Project): Promise<Project>;
+          SaveProjectAs(name: string, parentDir: string): Promise<Project>;
           AutoSave(): Promise<void>;
           RecentProjects(): Promise<any[]>;
           GetCurrentProject(): Promise<Project | null>;
@@ -33,6 +34,11 @@ declare global {
           UpdateTextClip(clipId: string, updated: TextClip): Promise<Project>;
           DeleteTextClip(clipId: string): Promise<Project>;
           MoveTextClip(clipId: string, newStart: number): Promise<Project>;
+          AddEffect(clipId: string, effect: Partial<Effect>): Promise<Project>;
+          UpdateEffect(clipId: string, effectId: string, updated: Effect): Promise<Project>;
+          RemoveEffect(clipId: string, effectId: string): Promise<Project>;
+          SetTransition(clipId: string, transition: Partial<Transition>): Promise<Project>;
+          RemoveTransition(clipId: string): Promise<Project>;
           OpenFileDialog(): Promise<string[]>;
           ImportMediaFiles(paths: string[]): Promise<{ project: Project; results: any[] }>;
           StartExport(settings: ExportSettings): Promise<string>;
@@ -50,10 +56,11 @@ export function createWailsBackend(): EditorBackend {
   const api = window.go.main.App;
 
   return {
-    newProject: (name, w, h, fps) => api.NewProject(name, w, h, fps),
+    newProject: (name, w, h, fps, parentDir) => api.NewProject(name, w, h, fps, parentDir || ""),
     openProject: (dir) => api.OpenProject(dir),
     saveProject: () => api.SaveProject(),
-    saveProjectAs: (name) => api.SaveProjectAs(name),
+    replaceProject: (project) => api.ReplaceProject(project),
+    saveProjectAs: (name, parentDir) => api.SaveProjectAs(name, parentDir || ""),
     autoSave: () => api.AutoSave(),
     recentProjects: () => api.RecentProjects(),
     getCurrentProject: () => api.GetCurrentProject(),
@@ -77,6 +84,12 @@ export function createWailsBackend(): EditorBackend {
     updateTextClip: (clipId, updated) => api.UpdateTextClip(clipId, updated),
     deleteTextClip: (clipId) => api.DeleteTextClip(clipId),
     moveTextClip: (clipId, newStartSec) => api.MoveTextClip(clipId, newStartSec),
+
+    addEffect: (clipId, effect) => api.AddEffect(clipId, effect),
+    updateEffect: (clipId, effectId, updated) => api.UpdateEffect(clipId, effectId, updated),
+    removeEffect: (clipId, effectId) => api.RemoveEffect(clipId, effectId),
+    setTransition: (clipId, transition) => api.SetTransition(clipId, transition),
+    removeTransition: (clipId) => api.RemoveTransition(clipId),
 
     openFileDialog: () => api.OpenFileDialog(),
     importMediaFiles: async (paths) => {

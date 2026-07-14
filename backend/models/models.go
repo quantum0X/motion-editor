@@ -7,7 +7,10 @@
 // UI can't parse correctly.
 package models
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // MediaType enumerates the kinds of source media a project can import.
 type MediaType string
@@ -116,6 +119,23 @@ type Clip struct {
 	Transition       *Transition `json:"transition,omitempty"` // transition INTO the next clip on this track, if any; nil means a hard cut
 }
 
+// MarshalJSON normalizes Effects/Keyframes to non-nil arrays for the same
+// reason documented on Track.MarshalJSON above - most Clip{} construction
+// sites only set the fields relevant to the operation at hand (e.g.
+// AddClipToTrack never touches Effects), leaving these nil and therefore
+// `null` on the wire unless normalized here.
+func (c Clip) MarshalJSON() ([]byte, error) {
+	type alias Clip
+	a := alias(c)
+	if a.Effects == nil {
+		a.Effects = []Effect{}
+	}
+	if a.Keyframes == nil {
+		a.Keyframes = []Keyframe{}
+	}
+	return json.Marshal(a)
+}
+
 // TextClip is a title/caption placed directly on the timeline. Unlike
 // Clip, it has no AssetID — its "content" is the styling and text baked
 // into the clip itself, since text isn't sourced from an imported media
@@ -182,9 +202,44 @@ type Track struct {
 	Locked        bool           `json:"locked"`
 	Hidden        bool           `json:"hidden"` // video tracks: skip in preview/export compositing
 	Muted         bool           `json:"muted"`  // audio-bearing tracks: skip in audio mixdown
+	Height        int            `json:"height,omitempty"` // per-track timeline lane height in px; 0 means "use the UI default"
 	Clips         []Clip         `json:"clips"`
 	TextClips     []TextClip     `json:"textClips"`     // only populated for Type == TrackText
 	SubtitleClips []SubtitleClip `json:"subtitleClips"` // only populated for Type == TrackSubtitle
+}
+
+// MarshalJSON normalizes every slice field to a non-nil (possibly empty)
+// array before serializing.
+//
+// Why this exists: a Track literal that only sets Clips (e.g. a freshly
+// created video/audio track never touches TextClips/SubtitleClips) leaves
+// those fields at Go's zero value for a slice, which is `nil`. Go's
+// encoding/json marshals a nil slice as JSON `null`, not `[]` - even
+// though the field has no `omitempty` tag. The frontend (see
+// frontend/src/types/project.ts) always types these as arrays and calls
+// array methods on them unconditionally (e.g. `track.textClips.map(...)`
+// or `project.tracks.flatMap(t => t.textClips)`); receiving `null`
+// instead of `[]` for any non-text/non-subtitle track throws a
+// TypeError deep in a render function, which (with no error boundary
+// mounted) unmounts the entire React tree and leaves a blank/black
+// screen - this was a real, reproduced bug (nil TextClips on the
+// video/audio tracks created by NewProject), not a hypothetical one.
+// A type-local MarshalJSON is a more durable fix than hunting down and
+// fixing every Track{} construction site by hand, since it also covers
+// call sites added later.
+func (t Track) MarshalJSON() ([]byte, error) {
+	type alias Track // avoids infinite recursion into this same MarshalJSON
+	a := alias(t)
+	if a.Clips == nil {
+		a.Clips = []Clip{}
+	}
+	if a.TextClips == nil {
+		a.TextClips = []TextClip{}
+	}
+	if a.SubtitleClips == nil {
+		a.SubtitleClips = []SubtitleClip{}
+	}
+	return json.Marshal(a)
 }
 
 // Effect is one stackable visual effect applied to a Clip. Effects on a
