@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { Project, Clip } from "../../types/project";
+import { resolveMediaUrl } from "../../utils/mediaUrl";
 
 /**
  * useAudioSync plays sound during preview. The video elements used by
@@ -34,9 +35,15 @@ export function useAudioSync(project: Project | null, playheadSec: number, isPla
       if (audioElementsRef.current.has(assetId)) continue;
 
       const el = asset.mediaType === "audio" ? document.createElement("audio") : document.createElement("video");
-      el.src = asset.filePath;
       el.preload = "auto";
       audioElementsRef.current.set(assetId, el);
+      resolveMediaUrl(asset.filePath)
+        .then((url) => {
+          el.src = url;
+        })
+        .catch((err) => {
+          console.error(`Failed to load audio for asset ${asset.fileName}:`, err);
+        });
     }
 
     for (const [assetId, el] of audioElementsRef.current) {

@@ -76,6 +76,10 @@ export interface EditorBackend {
 
   // Media import
   openFileDialog(): Promise<string[]>;
+  // Resolves a raw filesystem path (MediaAsset.filePath/thumbnailPath)
+  // into a data: URL an HTML element can load - see utils/mediaUrl.ts
+  // for the full explanation of why this is necessary at all.
+  readMediaFileAsDataUrl(path: string): Promise<string>;
   importMediaFiles(filePaths: string[]): Promise<{ project: Project; errors: { fileName?: string; error: string }[] }>;
 
   // Export

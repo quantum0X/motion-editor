@@ -40,6 +40,7 @@ declare global {
           SetTransition(clipId: string, transition: Partial<Transition>): Promise<Project>;
           RemoveTransition(clipId: string): Promise<Project>;
           OpenFileDialog(): Promise<string[]>;
+          ReadMediaFileAsDataURL(path: string): Promise<string>;
           ImportMediaFiles(paths: string[]): Promise<{ project: Project; results: any[] }>;
           StartExport(settings: ExportSettings): Promise<string>;
           CancelExport(): Promise<void>;
@@ -92,6 +93,7 @@ export function createWailsBackend(): EditorBackend {
     removeTransition: (clipId) => api.RemoveTransition(clipId),
 
     openFileDialog: () => api.OpenFileDialog(),
+    readMediaFileAsDataUrl: (path) => api.ReadMediaFileAsDataURL(path),
     importMediaFiles: async (paths) => {
       const result = await api.ImportMediaFiles(paths);
       const errors = (result.results || [])

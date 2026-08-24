@@ -521,3 +521,135 @@ deliberately rather than as a side effect of this pass.
   the mock backend exercises every new code path end-to-end, but real
   desktop-app manual testing is still the next actual step, same as the
   previous session's notes already said.
+
+---
+
+## Session N+2: real-backend bugs found via testing on an actual build (Windows)
+
+The person tested an actual build this time (screenshots show the real
+native app window, not the browser mock), and reported several bugs.
+Investigated each against the real Go backend + Wails integration
+(which the previous two sessions could build/vet/typecheck but never
+actually run as a desktop app) - two of these turned out to be the same
+root cause, and the "black screen" one was a real, previously-latent
+architecture gap.
+
+### THE big one: preview was black because local media files were never loadable at all
+`MediaAsset.FilePath`/`ThumbnailPath` store a plain absolute OS path
+(e.g. `/home/alice/Videos/clip.mp4`). The frontend was assigning that
+directly to `video.src` / `img.src` / a CSS `background-image` url.
+That is not a valid URL, and Wails' asset server only serves the
+embedded frontend bundle - it has no built-in route for arbitrary local
+files. So every `<video>`/`<img>` in the real app was simply never
+loading anything - not "loading and failing to draw," just never
+loading at all - hence a permanently black canvas. This had nothing to
+do with the compositor logic itself (already correct), and nothing
+about it would ever surface when testing against the mock backend
+(whose "file paths" are browser blob: URLs, which load fine directly) -
+which is why it went unnoticed through two previous sessions that only
+had the mock target to test against.
+
+Fixed with a new bound Go method, `ReadMediaFileAsDataURL(path)`
+(`app.go`), that reads the file and returns a `data:<mime>;base64,...`
+URL, plus a frontend resolver (`utils/mediaUrl.ts`:
+`resolveMediaUrl`/`useResolvedMediaUrl`, cached per path) used
+everywhere a `filePath`/`thumbnailPath` gets assigned to an element:
+`useCompositor.ts`, `useAudioSync.ts`, `TimelineClip.tsx`'s thumbnail,
+`MediaLibrary.tsx`'s thumbnail. Chose a bound-method/IPC approach over
+registering an HTTP route on the Wails asset server specifically
+because IPC bindings work identically in `wails dev` and a built app,
+while asset-server HTTP routing does not (dev mode proxies straight to
+the Vite dev server, bypassing any custom Go HTTP handler) - didn't want
+to fix this for `wails build` and leave it silently broken again in
+`wails dev`. Also fixed `MediaLibrary.tsx`'s thumbnail rendering, which
+was unconditionally using a `<video>` element for any video asset's
+thumbnail - correct only for the mock (where thumbnailPath happens to
+equal the source blob URL), but wrong for the real backend (where
+thumbnailPath is a genuine JPEG file) which needs an `<img>`.
+
+Known limitation: reads the whole file into memory per resolve call
+(cached after the first time). Fine for the clip sizes this editor
+targets; would need to become a streamed/range-request approach if
+very large source files become a real use case - noted in the code.
+
+### Clips silently colliding on ID - likely on Windows specifically
+This explains three of the reported symptoms at once: "selecting one
+clip auto-selects the same clip on another track," "an operation on one
+clip removes another," and general flakiness after any drag/split.
+`newID()` (used for every new clip's ID unless the caller pre-supplies
+one) read 8 bytes from `/dev/urandom` to build a random ID.
+`/dev/urandom` **does not exist on Windows**. The code treated
+`os.Open` failing as non-fatal ("best effort") and silently fell
+through with its all-zero starting buffer - so on Windows, `newID()`
+returned the exact same string, `"id_0"`, for literally every clip,
+every time. Any two clips created that way had the same ID from the
+model's point of view; `removeClip`, `MoveClip`, `TrimClip`, etc. all
+match by ID equality, so an operation meant for "this one clip" acted
+on every clip sharing that ID - which, on Windows, was potentially all
+of them. Fixed by replacing the hand-rolled `/dev/urandom` reader with
+`uuid.NewString()` (already a dependency, already used for
+Project/MediaAsset IDs) - no platform-specific behavior, and now
+consistent with how every other ID in this codebase is generated.
+
+### Couldn't drag a clip onto a different track
+`TimelineClip.tsx`'s move-drag only ever computed a new *time* via
+horizontal mouse delta; the track ID passed to `moveClip` was hard-coded
+to the clip's own current track - there was no code path that could
+ever put a clip on a different track by dragging, even though the Go
+`MoveClip` binding already fully supported it (`app.go` even said so in
+its own doc comment). Added: the drag now tracks which track lane the
+cursor is over (via `document.elementFromPoint` + a `data-track-id`/
+`data-track-type` attribute added to each track's clip lane -
+`utils/dragCoordinator.ts`), highlights it when the track type matches
+the clip's own type (a video clip can't land on an audio track), and
+calls `moveClip` with that track on drop instead of always the original
+one. Also added a Go-side guard rejecting a cross-type move outright
+(`MoveClip` now checks the target track's `Type` against the clip's
+current track's `Type`), so a stray frontend bug can't silently put a
+video clip in an audio-only lane.
+
+### Media-library drag-and-drop onto the timeline
+Rebuilt on the same custom pointer-tracking approach as the clip
+dragging above, replacing HTML5 native `draggable`/`dataTransfer`
+Drag-and-Drop entirely. This app's own clip dragging/trimming was
+already built this way rather than on native DnD - and for good reason:
+HTML5 DnD behavior (especially `dataTransfer` payload survival and drag
+image rendering) is inconsistent across the different webviews Wails
+uses per OS (WebView2 / WebKitGTK / WKWebView), which is a
+well-documented pain point for Wails apps specifically. Native DnD combined
+with a custom `draggable` element competing for the same mousedown was
+also a plausible source of "drag and drop not working" reports on its
+own, separate from anything track-move related. `MediaCard` now starts
+a small floating "dragging <filename>" label on mousedown, highlights
+the track lane under the cursor if it's type-compatible, and calls
+`addClip` directly on mouseup over a valid track - same mechanism as
+the cross-track clip move above, sharing `utils/dragCoordinator.ts`.
+Double-click-to-add-at-playhead (from the previous session) is
+unaffected and still works as a second way in.
+
+### Transitions: added a visible entry point on the timeline itself
+The transition picker already existed (added last session) but only
+inside the Effects panel, reachable by selecting/double-clicking a
+clip first - not discoverable as "a transition option" the way the
+screenshot's handwritten note expected. Added a small button that
+appears directly at every clip-to-clip boundary with no gap between
+them (`TimelineTrack.tsx`), showing filled/highlighted state once a
+transition is set; clicking it opens the same Effects panel, scrolled
+to the same Transition section as before. Same underlying data model
+and same export limitation as noted last session (transition data
+saves with the project; rendering it into the actual exported video
+isn't wired into `backend/export/builder.go` yet) - still stated
+directly in the panel, not glossed over.
+
+### Verification
+`go build ./...` / `go vet ./...`, `tsc --noEmit`, `npm run build`, and
+`eslint` on every changed file all pass clean (some pre-existing
+`@typescript-eslint`/experimental-react-compiler warnings remain
+elsewhere in the codebase, unrelated to this session's changes - same
+baseline noise as previous sessions' notes already mention). Still no
+real Wails/Windows environment available in this sandbox to click
+through the fixes myself - these are all traced to concrete, named
+lines of code with a specific failure mechanism explained above, not
+guesses, but an actual test pass on a real Windows build (where several
+of these specifically manifest, per `/dev/urandom` not existing there)
+is still the right next step before considering this closed.

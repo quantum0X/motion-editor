@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback } from "react";
 import type { Project, Clip, Track, TextClip, Effect } from "../../types/project";
+import { resolveMediaUrl } from "../../utils/mediaUrl";
 
 /**
  * useCompositor drives a <canvas> preview by:
@@ -65,7 +66,6 @@ export function useCompositor(
 
       if (asset.mediaType === "video" && !videoElementsRef.current.has(assetId)) {
         const video = document.createElement("video");
-        video.src = asset.filePath;
         video.muted = true; // canvas compositor handles visuals only; audio is mixed/played separately (see useAudioSync)
         video.preload = "auto";
         video.playsInline = true;
@@ -79,13 +79,31 @@ export function useCompositor(
         // own styling, not via detachment).
         hiddenHostRef.current?.appendChild(video);
         videoElementsRef.current.set(assetId, { el: video, assetId });
+        // asset.filePath is a raw filesystem path from the real backend
+        // (not a browser-loadable URL) - resolve it before assigning src.
+        // Until this resolves the element just has no src, so the draw
+        // loop's videoWidth/videoHeight check below naturally skips
+        // drawing it (a legitimate loading state, not a bug).
+        resolveMediaUrl(asset.filePath)
+          .then((url) => {
+            video.src = url;
+          })
+          .catch((err) => {
+            console.error(`Failed to load video asset ${asset.fileName}:`, err);
+          });
       }
 
       if (asset.mediaType === "image" && !imageElementsRef.current.has(assetId)) {
         const img = new Image();
-        img.src = asset.filePath;
         hiddenHostRef.current?.appendChild(img);
         imageElementsRef.current.set(assetId, img);
+        resolveMediaUrl(asset.filePath)
+          .then((url) => {
+            img.src = url;
+          })
+          .catch((err) => {
+            console.error(`Failed to load image asset ${asset.fileName}:`, err);
+          });
       }
     }
 

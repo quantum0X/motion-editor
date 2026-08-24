@@ -2,6 +2,8 @@ import { useState, useRef, useCallback } from "react";
 import type { Clip, MediaAsset, Track } from "../../types/project";
 import { useEditorStore } from "../../stores/editorStore";
 import { formatTimecode } from "../../utils/time";
+import { useResolvedMediaUrl } from "../../utils/mediaUrl";
+import { findTrackElementAtPoint } from "../../utils/dragCoordinator";
 
 interface TimelineClipProps {
   clip: Clip;
@@ -42,6 +44,7 @@ export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelec
 
   const isVideo = track.type === "video";
   const baseColor = isVideo ? "bg-track-video-clip" : "bg-track-audio-clip";
+  const thumbnailUrl = useResolvedMediaUrl(asset?.thumbnailPath);
 
   /** Collects every other clip's start/end (in seconds) across all tracks, plus the playhead, used for snap targets while dragging. */
   const getSnapPoints = useCallback((): number[] => {
@@ -82,12 +85,29 @@ export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelec
       setDragMode(mode);
       dragStartRef.current = { mouseX: e.clientX, clipStart: clip.timelineStartSec, clipEnd: clip.timelineEndSec };
 
+      // Cross-track dragging (move mode only): track which track lane
+      // the cursor is currently over, so dropping on a different
+      // (type-compatible) track actually moves the clip there instead
+      // of only ever repositioning it in time on its original track.
+      let hoveredTrackEl: HTMLElement | null = null;
+      const clearHighlight = () => {
+        hoveredTrackEl?.classList.remove("bg-accent/15", "ring-1", "ring-accent", "ring-inset");
+      };
+
       const handleMouseMove = (moveEvent: MouseEvent) => {
         if (!dragStartRef.current) return;
         const deltaPx = moveEvent.clientX - dragStartRef.current.mouseX;
         const deltaSec = deltaPx / pixelsPerSecond;
 
         if (mode === "move") {
+          const trackEl = findTrackElementAtPoint(moveEvent.clientX, moveEvent.clientY);
+          if (trackEl !== hoveredTrackEl) {
+            clearHighlight();
+            hoveredTrackEl = trackEl;
+          }
+          const compatible = hoveredTrackEl?.dataset.trackType === track.type && hoveredTrackEl?.dataset.trackId !== track.id;
+          if (compatible) hoveredTrackEl!.classList.add("bg-accent/15", "ring-1", "ring-accent", "ring-inset");
+
           const rawStart = dragStartRef.current.clipStart + deltaSec;
           const { time: snappedStart, snapped } = snapTime(Math.max(0, rawStart));
           const offset = snappedStart - dragStartRef.current.clipStart;
@@ -111,15 +131,25 @@ export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelec
         }
       };
 
-      const handleMouseUp = () => {
+      const handleMouseUp = (upEvent: MouseEvent) => {
         window.removeEventListener("mousemove", handleMouseMove);
         window.removeEventListener("mouseup", handleMouseUp);
+        clearHighlight();
 
         if (dragStartRef.current) {
           const finalOffset = liveOffsetRef.current;
-          if (Math.abs(finalOffset) > 0.001) {
+
+          let targetTrackId = track.id;
+          if (mode === "move") {
+            const trackEl = findTrackElementAtPoint(upEvent.clientX, upEvent.clientY);
+            if (trackEl?.dataset.trackType === track.type && trackEl.dataset.trackId) {
+              targetTrackId = trackEl.dataset.trackId;
+            }
+          }
+
+          if (Math.abs(finalOffset) > 0.001 || targetTrackId !== track.id) {
             if (mode === "move") {
-              moveClip(clip.id, track.id, Math.max(0, dragStartRef.current.clipStart + finalOffset));
+              moveClip(clip.id, targetTrackId, Math.max(0, dragStartRef.current.clipStart + finalOffset));
             } else if (mode === "trim-left") {
               trimClip(clip.id, dragStartRef.current.clipStart + finalOffset, -1);
             } else if (mode === "trim-right") {
@@ -138,7 +168,7 @@ export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelec
       window.addEventListener("mousemove", handleMouseMove);
       window.addEventListener("mouseup", handleMouseUp);
     },
-    [clip, track.id, pixelsPerSecond, selectClip, moveClip, trimClip, snapTime]
+    [clip, track.id, track.type, pixelsPerSecond, selectClip, moveClip, trimClip, snapTime]
   );
 
   let displayLeft = left;
@@ -167,10 +197,10 @@ export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelec
       title={`${asset?.fileName ?? "Unknown"} — ${formatTimecode(clip.timelineStartSec, fps)} to ${formatTimecode(clip.timelineEndSec, fps)}`}
     >
       {/* Thumbnail strip background for video clips */}
-      {isVideo && asset?.thumbnailPath && (
+      {isVideo && thumbnailUrl && (
         <div
           className="absolute inset-0 opacity-40 bg-cover bg-center"
-          style={{ backgroundImage: `url(${asset.thumbnailPath})` }}
+          style={{ backgroundImage: `url(${thumbnailUrl})` }}
         />
       )}
 

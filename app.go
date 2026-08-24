@@ -8,13 +8,16 @@ import (
 	"bufio"
 	"context"
 	"embed"
+	"encoding/base64"
 	"fmt"
+	"mime"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/google/uuid"
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
@@ -255,6 +258,11 @@ func (a *App) MoveClip(clipID, newTrackID string, newStartSec float64) (*models.
 	}
 	if targetIdx == -1 {
 		return nil, fmt.Errorf("target track %s not found", newTrackID)
+	}
+	if proj.Tracks[targetIdx].Type != proj.Tracks[foundTrackIdx].Type {
+		return nil, fmt.Errorf(
+			"cannot move a %s clip onto a %s track", proj.Tracks[foundTrackIdx].Type, proj.Tracks[targetIdx].Type,
+		)
 	}
 
 	for _, existing := range proj.Tracks[targetIdx].Clips {
@@ -955,6 +963,81 @@ func (a *App) RemoveKeyframe(clipID, keyframeID string) (*models.Project, error)
 	return nil, fmt.Errorf("clip %s not found", clipID)
 }
 
+// mimeOverrides fills gaps in Go's built-in mime.TypeByExtension, which
+// on some platforms doesn't know common video/audio extensions at all
+// (returning "" rather than a sensible default) - without this, some
+// browsers/webviews refuse to play a data: URL that has no usable MIME
+// type.
+var mimeOverrides = map[string]string{
+	".mp4":  "video/mp4",
+	".m4v":  "video/mp4",
+	".mov":  "video/quicktime",
+	".webm": "video/webm",
+	".mkv":  "video/x-matroska",
+	".avi":  "video/x-msvideo",
+	".mp3":  "audio/mpeg",
+	".wav":  "audio/wav",
+	".aac":  "audio/aac",
+	".flac": "audio/flac",
+	".m4a":  "audio/mp4",
+	".ogg":  "audio/ogg",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".png":  "image/png",
+	".gif":  "image/gif",
+	".webp": "image/webp",
+}
+
+func mimeTypeFor(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	if m, ok := mimeOverrides[ext]; ok {
+		return m
+	}
+	if m := mime.TypeByExtension(ext); m != "" {
+		return m
+	}
+	return "application/octet-stream"
+}
+
+// ReadMediaFileAsDataURL reads a local media file (video/audio/image)
+// from disk and returns it as a data: URL.
+//
+// Why this exists: MediaAsset.FilePath/ThumbnailPath are plain absolute
+// filesystem paths. That is not a URL any <video>/<audio>/<img> element
+// or canvas can load - the Wails asset server only serves the embedded
+// frontend bundle out of the box, it has no built-in route for
+// arbitrary local files. Without something bridging that gap, every
+// video and every thumbnail in the app renders as nothing (a
+// permanently black canvas / broken image), regardless of anything else
+// being correct - this was a real, previously-missing piece, not a
+// hypothetical edge case.
+//
+// This goes through a bound Go method (IPC) rather than an HTTP route
+// registered on the asset server specifically because IPC bindings work
+// identically in `wails dev` and a built app, whereas HTTP asset routing
+// differs between the two (dev mode proxies the frontend dev server
+// directly, bypassing custom asset-server handlers) - so this is the
+// one approach that doesn't need special-casing per run mode.
+//
+// It reads the whole file into memory, which is fine for the clip
+// lengths this editor currently targets; if very large source files
+// become a real use case, this should become a streamed, range-request
+// capable HTTP approach instead.
+func (a *App) ReadMediaFileAsDataURL(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("reading media file: %w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("%s is a directory, not a file", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading media file: %w", err)
+	}
+	return "data:" + mimeTypeFor(path) + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+}
+
 // --- Media import (bound methods) ---
 
 // ImportMediaFilesResult wraps ImportMediaFiles' output for the same
@@ -1142,32 +1225,30 @@ func lastLines(s string, n int) string {
 	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
-// newID generates a short random-ish ID without pulling in the uuid
-// package for every call site that just needs a fresh string ID (clip
-// IDs from split/duplicate, export job IDs). Not used for MediaAsset or
-// Project IDs, which use uuid.NewString() in their respective packages
-// for stronger uniqueness guarantees across longer-lived persisted data.
+// newID generates a fresh short-ish unique ID for clip IDs from
+// split/duplicate/add operations (Project/MediaAsset IDs use
+// uuid.NewString() directly in their own packages).
+//
+// This used to hand-roll a random ID by reading 8 bytes from
+// /dev/urandom. That path does not exist on Windows at all -
+// os.Open("/dev/urandom") fails there, the code treated that failure as
+// non-fatal ("best effort") and silently fell through with the
+// all-zero byte buffer it started with, so randUint64() returned 0
+// every single time on Windows. That made newID() return the exact
+// same string, "id_0", for every clip - which meant every clip added
+// via drag-and-drop/double-click/split/duplicate on Windows silently
+// collided on ID with every other clip that had gone through the same
+// path. Selecting, moving, or deleting "one" clip then actually
+// selected/moved/deleted *every* clip sharing that ID, since
+// removeClip and every clipID-based lookup match by equality - this
+// was the actual cause of "selecting one selects all the corresponding
+// clips" and "an operation on one clip removes another one" reported
+// against the Windows build. uuid.NewString() has no such platform gap
+// and is already a dependency used for Project/MediaAsset IDs, so this
+// just makes clip IDs consistent with those instead of maintaining a
+// second, platform-fragile ID scheme.
 func newID() string {
-	return fmt.Sprintf("id_%d", randUint64())
-}
-
-func randUint64() uint64 {
-	// Minimal, dependency-free pseudo-random source sufficient for
-	// short-lived in-session IDs (clip/job IDs). Not cryptographically
-	// secure and not intended to be - if this becomes a correctness
-	// concern (e.g. collision risk in a very long session), switch to
-	// uuid.NewString() like the project/media packages do.
-	var b [8]byte
-	f, err := os.Open("/dev/urandom")
-	if err == nil {
-		defer f.Close()
-		_, _ = f.Read(b[:])
-	}
-	var v uint64
-	for i := 0; i < 8; i++ {
-		v = v<<8 | uint64(b[i])
-	}
-	return v
+	return "id_" + uuid.NewString()
 }
 
 func main() {

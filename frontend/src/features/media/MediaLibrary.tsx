@@ -4,6 +4,8 @@ import { useEditorStore } from "../../stores/editorStore";
 import { formatDuration, formatFileSize } from "../../utils/time";
 import type { MediaAsset } from "../../types/project";
 import { registerObjectUrlFileName } from "../../services/objectUrlRegistry";
+import { isDirectlyLoadableUrl, useResolvedMediaUrl } from "../../utils/mediaUrl";
+import { createDragGhost, findTrackElementAtPoint } from "../../utils/dragCoordinator";
 
 export function MediaLibrary() {
   const project = useEditorStore((s) => s.project);
@@ -110,32 +112,102 @@ export function MediaLibrary() {
 
 function MediaCard({ asset }: { asset: MediaAsset }) {
   const addAssetAtPlayhead = useEditorStore((s) => s.addAssetAtPlayhead);
+  const addClip = useEditorStore((s) => s.addClip);
+  const pixelsPerSecond = useEditorStore((s) => s.pixelsPerSecond);
+  const thumbnailUrl = useResolvedMediaUrl(asset.thumbnailPath);
 
-  const handleDragStart = (e: React.DragEvent) => {
-    e.dataTransfer.setData("application/x-media-asset-id", asset.id);
-    e.dataTransfer.effectAllowed = "copy";
-  };
+  // Custom pointer-based drag onto the timeline, instead of HTML5 native
+  // Drag-and-Drop - see utils/dragCoordinator.ts for why: DnD support is
+  // inconsistent across the different webviews Wails uses per OS, and
+  // this app's own timeline clip dragging already avoids it for the
+  // same reason. mousedown starts tracking; a floating label follows
+  // the cursor; the track lane under the cursor is highlighted if it
+  // can accept this asset's media type; mouseup over a valid track adds
+  // the clip there.
+  const handlePointerDown = useCallback(
+    (e: React.MouseEvent) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      const ghost = createDragGhost(asset.fileName);
+      ghost.moveTo(e.clientX, e.clientY);
+      let hoveredEl: HTMLElement | null = null;
+
+      const isCompatible = (trackType: string | undefined) =>
+        asset.mediaType === "audio" ? trackType === "audio" : trackType === "video";
+
+      const clearHighlight = () => {
+        hoveredEl?.classList.remove("bg-accent/15", "ring-1", "ring-accent", "ring-inset");
+      };
+
+      const handleMove = (moveEvent: MouseEvent) => {
+        ghost.moveTo(moveEvent.clientX, moveEvent.clientY);
+        const trackEl = findTrackElementAtPoint(moveEvent.clientX, moveEvent.clientY);
+        if (trackEl !== hoveredEl) {
+          clearHighlight();
+          hoveredEl = trackEl;
+        }
+        if (hoveredEl && isCompatible(hoveredEl.dataset.trackType)) {
+          hoveredEl.classList.add("bg-accent/15", "ring-1", "ring-accent", "ring-inset");
+        }
+      };
+
+      const handleUp = (upEvent: MouseEvent) => {
+        window.removeEventListener("mousemove", handleMove);
+        window.removeEventListener("mouseup", handleUp);
+        ghost.remove();
+        clearHighlight();
+
+        const trackEl = findTrackElementAtPoint(upEvent.clientX, upEvent.clientY);
+        const trackId = trackEl?.dataset.trackId;
+        const trackType = trackEl?.dataset.trackType;
+        if (!trackId || !isCompatible(trackType)) return;
+
+        const rect = trackEl!.getBoundingClientRect();
+        const dropStartSec = Math.max(0, (upEvent.clientX - rect.left) / pixelsPerSecond);
+        const duration = asset.mediaType === "image" ? 5 : asset.durationSec;
+
+        addClip(trackId, {
+          assetId: asset.id,
+          timelineStartSec: dropStartSec,
+          timelineEndSec: dropStartSec + duration,
+          sourceInSec: 0,
+          sourceOutSec: duration,
+          speed: 1,
+          opacity: 1,
+          volume: 1,
+          muted: false,
+          effects: [],
+          keyframes: [],
+          transition: null,
+        });
+      };
+
+      window.addEventListener("mousemove", handleMove);
+      window.addEventListener("mouseup", handleUp);
+    },
+    [asset, pixelsPerSecond, addClip]
+  );
 
   const Icon = asset.mediaType === "video" ? Film : asset.mediaType === "audio" ? Music : ImageIcon;
 
   return (
     <div
-      draggable
-      onDragStart={handleDragStart}
+      onMouseDown={handlePointerDown}
       onDoubleClick={() => addAssetAtPlayhead(asset.id)}
       className="group rounded-md overflow-hidden bg-surface-2 hover:bg-surface-3 cursor-grab active:cursor-grabbing transition-colors"
-      title={`${asset.fileName} — double-click to add at the playhead, or drag onto the timeline`}
+      title={`${asset.fileName} — double-click to add at the playhead, or drag onto a track`}
     >
       <div className="relative aspect-video bg-surface-0 flex items-center justify-center overflow-hidden">
-        {asset.thumbnailPath ? (
-          asset.mediaType === "video" ? (
-            // Dev mode: thumbnailPath is the same object URL as the
-            // source video, so we use the <video> element itself as a
-            // poster-frame substitute. Real Wails mode uses an actual
-            // generated JPEG thumbnail file path here instead.
-            <video src={asset.thumbnailPath} className="w-full h-full object-cover" muted preload="metadata" />
+        {thumbnailUrl ? (
+          asset.mediaType === "video" && isDirectlyLoadableUrl(asset.thumbnailPath) ? (
+            // Mock/dev mode only: thumbnailPath there is the same blob
+            // URL as the source video itself (no real still-frame JPEG
+            // exists), so the <video> element doubles as a poster-frame
+            // substitute. The real backend always generates an actual
+            // JPEG thumbnail file, rendered via <img> below instead.
+            <video src={thumbnailUrl} className="w-full h-full object-cover" muted preload="metadata" />
           ) : (
-            <img src={asset.thumbnailPath} className="w-full h-full object-cover" />
+            <img src={thumbnailUrl} className="w-full h-full object-cover" />
           )
         ) : (
           <Icon size={20} className="text-text-tertiary" />

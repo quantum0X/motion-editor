@@ -467,6 +467,12 @@ export function createMockBackend(): EditorBackend {
       return [];
     },
 
+    async readMediaFileAsDataUrl(path) {
+      // In mock mode, "paths" are already blob: URLs the browser can
+      // load directly (see mockMediaImport.ts) - nothing to resolve.
+      return path;
+    },
+
     async importMediaFiles(filePaths) {
       // In mock mode, "file paths" are actually object URLs created from
       // real File objects the user dropped/selected in the browser (see
