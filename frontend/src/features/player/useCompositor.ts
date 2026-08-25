@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback } from "react";
-import type { Project, Clip, Track, TextClip, Effect } from "../../types/project";
+import type { Project, Clip, Track, TextClip, Effect, InterpolationType, TransitionType } from "../../types/project";
 import { resolveMediaUrl } from "../../utils/mediaUrl";
 
 /**
@@ -35,6 +35,233 @@ interface VideoElementEntry {
   assetId: string;
 }
 
+/**
+ * Applies an easing curve to a normalized [0,1] progress value, used by
+ * transitions to accelerate/decelerate the blend between the outgoing and
+ * incoming clip.
+ */
+function applyEasing(t: number, easing: InterpolationType): number {
+  t = Math.max(0, Math.min(1, t));
+  switch (easing) {
+    case "easeIn":
+      return t * t;
+    case "easeOut":
+      return 1 - (1 - t) * (1 - t);
+    case "bezier":
+      // CSS "ease" approximation (cubic bezier 0.25 0.1 0.25 1)
+      return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    default:
+      return t;
+  }
+}
+
+/**
+ * Computes the source-media time for a clip at a given timeline position,
+ * accounting for the clip's source in-point and playback speed.
+ */
+function sourceTimeForClip(clip: Clip, timelineTime: number): number {
+  return clip.sourceInSec + (timelineTime - clip.timelineStartSec) * (clip.speed || 1);
+}
+
+/**
+ * Computes a clipping rectangle for a directional wipe/slide/push transition.
+ * The rectangle is the region where the incoming clip is visible; it grows
+ * from the specified direction as progress goes 0 → 1.
+ *   "left"  → reveals from left edge (left→right)
+ *   "right" → reveals from right edge (right→left)
+ *   "up"    → reveals from top edge (top→bottom)
+ *   "down"  → reveals from bottom edge (bottom→top)
+ */
+function wipeRect(
+  direction: string,
+  progress: number,
+  w: number,
+  h: number
+): { x: number; y: number; width: number; height: number } {
+  switch (direction) {
+    case "left":
+      return { x: 0, y: 0, width: w * progress, height: h };
+    case "right":
+      return { x: w * (1 - progress), y: 0, width: w * progress, height: h };
+    case "up":
+      return { x: 0, y: 0, width: w, height: h * progress };
+    default:
+      // "down"
+      return { x: 0, y: h * (1 - progress), width: w, height: h * progress };
+  }
+}
+/**
+ * Describes a transition that is currently being previewed on the
+ * timeline: the outgoing clip (the earlier one, which owns the
+ * transition), the incoming clip (its next on the same track), and the
+ * normalized blend progress (0 = start of the blend, 1 = fully switched
+ * to the incoming clip).
+ */
+interface ActiveTransition {
+  out: Clip;
+  in: Clip;
+  progress: number;
+  type: TransitionType;
+  direction: string;
+  easing: InterpolationType;
+}
+
+/**
+ * Given a track's clips (sorted by timeline start time), finds the
+ * transition whose window covers the given timeline time, if any.
+ *
+ * A transition is attached to the EARLIER clip and spans the tail of
+ * that clip up to the boundary with the next clip on the same track. The
+ * window is `[nextClip.timelineStartSec - durationSec, nextClip.timelineStartSec)`.
+ */
+function findActiveTransition(sortedClips: Clip[], t: number): ActiveTransition | null {
+  for (let i = 0; i < sortedClips.length - 1; i++) {
+    const out = sortedClips[i];
+    const next = sortedClips[i + 1];
+    if (!out.transition) continue;
+
+    const duration = out.transition.durationSec || 0;
+    if (duration <= 0) continue;
+
+    const boundary = Math.min(out.timelineEndSec, next.timelineStartSec);
+    const windowStart = boundary - duration;
+    if (t >= windowStart && t < boundary) {
+      const rawProgress = (t - windowStart) / duration;
+      return {
+        out,
+        in: next,
+        progress: Math.max(0, Math.min(1, rawProgress)),
+        type: out.transition.type,
+        direction: out.transition.direction || "left",
+        easing: out.transition.easing,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Pure drawing step for the outgoing+incoming pair of a transition. Given
+ * two already-seeked media sources and the transition's eased progress, it
+ * composites them as fade/dissolve (alpha cross-blend), wipe/slide/push
+ * (incoming revealed from a direction), or zoom (incoming scales up in).
+ *
+ * Both sources are drawn inside the same "contain" frame used by normal
+ * playback, so the framing never jumps during a transition.
+ */
+function drawTransitionPair(
+  ctx: CanvasRenderingContext2D,
+  outSource: { source: CanvasImageSource | null; srcW: number; srcH: number; filter: string; baseAlpha: number },
+  inSource: { source: CanvasImageSource | null; srcW: number; srcH: number; filter: string; baseAlpha: number },
+  progress: number, // eased, 0..1
+  type: TransitionType,
+  direction: string,
+  canvasWidth: number,
+  canvasHeight: number
+) {
+  if (!outSource.source && !inSource.source) return;
+
+  const outRect = containRect(outSource.srcW, outSource.srcH, canvasWidth, canvasHeight);
+  const inRect = containRect(inSource.srcW, inSource.srcH, canvasWidth, canvasHeight);
+
+  // Draw the outgoing clip first (underneath everything).
+  if (outSource.source) {
+    ctx.save();
+    ctx.filter = outSource.filter;
+    ctx.globalAlpha = outSource.baseAlpha;
+    ctx.drawImage(outSource.source, outRect.x, outRect.y, outRect.dw, outRect.dh);
+    ctx.restore();
+  }
+
+  if (!inSource.source) return;
+
+  switch (type) {
+    case "fade":
+    case "dissolve": {
+      // Cross-blend: outgoing stays put, incoming fades up over it.
+      ctx.save();
+      ctx.filter = inSource.filter;
+      ctx.globalAlpha = inSource.baseAlpha * progress;
+      ctx.drawImage(inSource.source, inRect.x, inRect.y, inRect.dw, inRect.dh);
+      ctx.restore();
+      break;
+    }
+    case "wipe": {
+      // Incoming revealed via a growing region from `direction`.
+      const region = wipeRect(direction, progress, canvasWidth, canvasHeight);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(region.x, region.y, region.width, region.height);
+      ctx.clip();
+      ctx.filter = inSource.filter;
+      ctx.globalAlpha = inSource.baseAlpha;
+      ctx.drawImage(inSource.source, inRect.x, inRect.y, inRect.dw, inRect.dh);
+      ctx.restore();
+      break;
+    }
+    case "slide":
+    case "push": {
+      // Incoming slides in from a direction while outgoing stays put.
+      const offsetX =
+        direction === "left" ? (1 - progress) * canvasWidth : direction === "right" ? -(1 - progress) * canvasWidth : 0;
+      const offsetY =
+        direction === "up" ? (1 - progress) * canvasHeight : direction === "down" ? -(1 - progress) * canvasHeight : 0;
+      ctx.save();
+      ctx.filter = inSource.filter;
+      ctx.globalAlpha = inSource.baseAlpha;
+      ctx.drawImage(inSource.source, inRect.x + offsetX, inRect.y + offsetY, inRect.dw, inRect.dh);
+      ctx.restore();
+      break;
+    }
+    case "zoom": {
+      // Incoming scales up from ~35% to full size as it fades in.
+      const scale = 0.35 + 0.65 * progress;
+      ctx.save();
+      ctx.translate(inRect.x + inRect.dw / 2, inRect.y + inRect.dh / 2);
+      ctx.scale(scale, scale);
+      ctx.filter = inSource.filter;
+      ctx.globalAlpha = inSource.baseAlpha * progress;
+      ctx.drawImage(inSource.source, -inRect.dw / 2, -inRect.dh / 2, inRect.dw, inRect.dh);
+      ctx.restore();
+      break;
+    }
+    default: {
+      ctx.save();
+      ctx.filter = inSource.filter;
+      ctx.globalAlpha = inSource.baseAlpha * progress;
+      ctx.drawImage(inSource.source, inRect.x, inRect.y, inRect.dw, inRect.dh);
+      ctx.restore();
+    }
+  }
+}
+
+/**
+ * Computes the "contain" rectangle for a source of the given aspect ratio
+ * fitted inside the canvas while preserving aspect ratio (letterboxing --
+ * object-fit: contain). Shared by drawContained and the transition
+ * renderer so every place that places a media frame on the canvas agrees
+ * exactly on the frame's bounds.
+ */
+function containRect(
+  srcWidth: number,
+  srcHeight: number,
+  canvasWidth: number,
+  canvasHeight: number
+): { x: number; y: number; dw: number; dh: number } {
+  if (!srcWidth || !srcHeight) return { x: 0, y: 0, dw: 0, dh: 0 };
+  const sourceAspect = srcWidth / srcHeight;
+  const canvasAspect = canvasWidth / canvasHeight;
+  let dw: number, dh: number;
+  if (sourceAspect > canvasAspect) {
+    dw = canvasWidth;
+    dh = canvasWidth / sourceAspect;
+  } else {
+    dh = canvasHeight;
+    dw = canvasHeight * sourceAspect;
+  }
+  return { x: (canvasWidth - dw) / 2, y: (canvasHeight - dh) / 2, dw, dh };
+}
+
 export function useCompositor(
   project: Project | null,
   canvasRef: React.RefObject<HTMLCanvasElement | null>,
@@ -45,6 +272,20 @@ export function useCompositor(
   const videoElementsRef = useRef<Map<string, VideoElementEntry>>(new Map());
   const imageElementsRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const rafRef = useRef<number | null>(null);
+  // Refs mirroring the latest playheadSec / isPlaying so that drawFrame —
+  // which runs inside a requestAnimationFrame callback — always reads
+  // the *current* values instead of a stale closure capture. This is
+  // critical: during playback playheadSec changes every frame, and baking
+  // it into drawFrame's useCallback deps would recreate drawFrame (and
+  // thus tear down & rebuild the entire RAF loop) sixty times a second,
+  // which races against the playback clock and starves the canvas of
+  // frames (the preview stops updating while the timeline keeps advancing).
+  // The same "read latest via ref inside a stable callback" pattern is
+  // already used correctly by usePlaybackClock's tick function.
+  const playheadSecRef = useRef(playheadSec);
+  const isPlayingRef = useRef(isPlaying);
+  playheadSecRef.current = playheadSec;
+  isPlayingRef.current = isPlaying;
 
   // --- Element pool management: create/destroy hidden <video>/<img>
   // elements as assets are referenced by clips on the timeline. ---
@@ -127,20 +368,46 @@ export function useCompositor(
   }, [project, hiddenHostRef]);
 
   // --- Play/pause: drive every active video element's native playback
-  // state so frames actually advance between our redraw calls. ---
+  // (or paused) state so frames actually advance between our redraw calls.
+  // When transitioning to playing we also nudge each already-decoded video
+  // element to the current playhead *before* calling play(), so playback
+  // doesn't start from a stale currentTime (e.g. 0 on a fresh load, or a
+  // position left over from a previous clip) and the very first drawn frame
+  // is correct instead of a one-frame flash from the wrong position. ---
   useEffect(() => {
-    for (const { el } of videoElementsRef.current.values()) {
-      if (isPlaying) {
+    if (!project) return;
+
+    if (isPlaying) {
+      const assetsById = new Map(project.assets.map((a) => [a.id, a]));
+      for (const track of project.tracks) {
+        if (track.type !== "video" || track.hidden) continue;
+        const clip = findActiveClip(track, playheadSec);
+        if (!clip) continue;
+        const asset = assetsById.get(clip.assetId);
+        if (!asset || asset.mediaType !== "video") continue;
+        const entry = videoElementsRef.current.get(asset.id);
+        if (!entry) continue;
+        const sourceTime = clip.sourceInSec + (playheadSec - clip.timelineStartSec) * (clip.speed || 1);
+        if (entry.el.readyState >= 1 && Math.abs(entry.el.currentTime - sourceTime) > SEEK_TOLERANCE_SEC) {
+          entry.el.currentTime = sourceTime;
+        }
+      }
+      // Now start every video element playing natively. Those that are
+      // already at the right position will show their decoded frame
+      // immediately; the drawFrame loop below keeps them in sync.
+      for (const { el } of videoElementsRef.current.values()) {
         el.play().catch(() => {
-          /* benign: browsers can reject play() if called before user
-             gesture in some contexts; the compositor will simply hold
-             on the last decoded frame until play succeeds. */
+          /* benign: browsers can reject play() if called before a user
+             gesture in some contexts; the compositor's drawFrame still
+             seeks and draws the correct frame on every tick. */
         });
-      } else {
+      }
+    } else {
+      for (const { el } of videoElementsRef.current.values()) {
         el.pause();
       }
     }
-  }, [isPlaying]);
+  }, [isPlaying, project, playheadSec]);
 
   const findActiveClip = useCallback((track: Track, atSec: number): Clip | null => {
     for (const clip of track.clips ?? []) {
@@ -150,7 +417,21 @@ export function useCompositor(
   }, []);
 
   // --- The render loop itself. ---
+  // drawFrame is a *stable* callback (its deps do NOT include playheadSec
+  // or isPlaying -- those are read from refs below). This is essential:
+  // if playheadSec were a dependency, playback would recreate drawFrame on
+  // every frame, causing the RAF useEffect below to cancel & reschedule
+  // the animation loop 60x/second -- racing the playback clock and leaving
+  // the canvas starved of frames (nothing renders while the timeline
+  // keeps advancing). By reading the latest values via refs we keep the
+  // RAF loop running continuously at full browser refresh rate.
   const drawFrame = useCallback(() => {
+    // Read latest values from refs -- updated on every React render --
+    // so the RAF callback always sees the current playhead/time without
+    // needing to be recreated.
+    const currentPlayhead = playheadSecRef.current;
+    const currentIsPlaying = isPlayingRef.current;
+
     const canvas = canvasRef.current;
     if (!canvas || !project) {
       // Don't just bail - reschedule. The canvas ref may not be attached
@@ -175,8 +456,93 @@ export function useCompositor(
     const assetsById = new Map(project.assets.map((a) => [a.id, a]));
     const videoTracks = project.tracks.filter((t) => t.type === "video" && !t.hidden).sort((a, b) => a.order - b.order);
 
+    // Local per-frame helpers used to render clips and transitions. These
+    // are recreated on every requestAnimationFrame tick (they're cheap);
+    // crucially they read the *current* drawFrame values (playhead, playing
+    // state, refs), which is what keeps the whole loop correct and stable.
+    const seekVideoNear = (video: HTMLVideoElement, atSec: number) => {
+      if (atSec < 0) atSec = 0;
+      if (!currentIsPlaying || Math.abs(video.currentTime - atSec) > SEEK_TOLERANCE_SEC) {
+        if (video.readyState >= 1) {
+          video.currentTime = atSec;
+        }
+      }
+    };
+
+    // Resolves a clip's media into a drawable atom at the given *source*
+    // time, seeking its underlying <video> element as needed. Returns null
+    // when the media isn't decodable yet (the transition just draws the side
+    // that is ready).
+    const mediaAtomFor = (clip: Clip, sourceTimeSec: number) => {
+      const asset = assetsById.get(clip.assetId);
+      if (!asset) return null;
+      if (asset.mediaType === "video") {
+        const video = videoElementsRef.current.get(asset.id)?.el;
+        if (!video) return null;
+        seekVideoNear(video, sourceTimeSec);
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          return { source: video, srcW: video.videoWidth, srcH: video.videoHeight };
+        }
+        return null;
+      }
+      if (asset.mediaType === "image") {
+        const img = imageElementsRef.current.get(asset.id);
+        if (img && img.complete) {
+          return { source: img, srcW: img.naturalWidth, srcH: img.naturalHeight };
+        }
+        return null;
+      }
+      return null;
+    };
+
+    // Draws the two sides of a transition at the current playhead: the
+    // outgoing clip continues forward at its real position while the
+    // incoming clip advances its head through the blend (so motion stays
+    // continuous across what would otherwise be a hard cut).
+    const drawPreviewTransition = (tr: ActiveTransition) => {
+      const progress = applyEasing(tr.progress, tr.easing);
+      const dur = (tr.out.transition && tr.out.transition.durationSec) || 1;
+
+      const outAtom = mediaAtomFor(tr.out, sourceTimeForClip(tr.out, currentPlayhead));
+      const inSourceTime = tr.in.sourceInSec + tr.progress * dur * (tr.in.speed || 1);
+      const inAtom = mediaAtomFor(tr.in, inSourceTime);
+
+      drawTransitionPair(
+        ctx,
+        {
+          source: outAtom ? outAtom.source : null,
+          srcW: outAtom ? outAtom.srcW : 0,
+          srcH: outAtom ? outAtom.srcH : 0,
+          filter: buildCanvasFilter(tr.out.effects ?? []),
+          baseAlpha: tr.out.opacity ?? 1,
+        },
+        {
+          source: inAtom ? inAtom.source : null,
+          srcW: inAtom ? inAtom.srcW : 0,
+          srcH: inAtom ? inAtom.srcH : 0,
+          filter: buildCanvasFilter(tr.in.effects ?? []),
+          baseAlpha: tr.in.opacity ?? 1,
+        },
+        progress,
+        tr.type,
+        tr.direction,
+        canvas.width,
+        canvas.height
+      );
+    };
+
     for (const track of videoTracks) {
-      const clip = findActiveClip(track, playheadSec);
+      const sortedClips = (track.clips ?? []).slice().sort((a, b) => a.timelineStartSec - b.timelineStartSec);
+
+      // If the playhead is inside a transition window, composite the outgoing
+      // + incoming clips instead of drawing a straight hard-cut active clip.
+      const activeTransition = findActiveTransition(sortedClips, currentPlayhead);
+      if (activeTransition) {
+        drawPreviewTransition(activeTransition);
+        continue;
+      }
+
+      const clip = findActiveClip(track, currentPlayhead);
       if (!clip) continue;
 
       const asset = assetsById.get(clip.assetId);
@@ -191,14 +557,14 @@ export function useCompositor(
         if (!entry) continue;
         const video = entry.el;
 
-        const sourceTime = clip.sourceInSec + (playheadSec - clip.timelineStartSec) * (clip.speed || 1);
+        const sourceTime = clip.sourceInSec + (currentPlayhead - clip.timelineStartSec) * (clip.speed || 1);
 
         // Only force a seek when not currently playing, or when natural
         // playback has drifted noticeably from where it should be (e.g.
         // right after a scrub or a clip boundary jump). This keeps
         // scrubbing precise while letting playback run smoothly off the
         // video element's own clock rather than fighting it every frame.
-        if (!isPlaying || Math.abs(video.currentTime - sourceTime) > SEEK_TOLERANCE_SEC) {
+        if (!currentIsPlaying || Math.abs(video.currentTime - sourceTime) > SEEK_TOLERANCE_SEC) {
           if (video.readyState >= 1) {
             video.currentTime = sourceTime;
           }
@@ -237,13 +603,13 @@ export function useCompositor(
     const textTracks = project.tracks.filter((t) => t.type === "text" && !t.hidden).sort((a, b) => a.order - b.order);
     for (const track of textTracks) {
       for (const tc of track.textClips ?? []) {
-        if (playheadSec < tc.timelineStartSec || playheadSec >= tc.timelineEndSec) continue;
+        if (currentPlayhead < tc.timelineStartSec || currentPlayhead >= tc.timelineEndSec) continue;
         drawTextClip(ctx, tc, canvas.width, canvas.height);
       }
     }
 
     rafRef.current = requestAnimationFrame(drawFrame);
-  }, [project, playheadSec, isPlaying, canvasRef, findActiveClip]);
+  }, [project, canvasRef, findActiveClip]);
 
   useEffect(() => {
     rafRef.current = requestAnimationFrame(drawFrame);
@@ -407,3 +773,4 @@ function drawTextClip(ctx: CanvasRenderingContext2D, tc: TextClip, canvasWidth: 
 
   ctx.restore();
 }
+
