@@ -40,7 +40,7 @@ interface VideoElementEntry {
  * transitions to accelerate/decelerate the blend between the outgoing and
  * incoming clip.
  */
-function applyEasing(t: number, easing: InterpolationType): number {
+export function applyEasing(t: number, easing: InterpolationType): number {
   t = Math.max(0, Math.min(1, t));
   switch (easing) {
     case "easeIn":
@@ -72,7 +72,7 @@ function sourceTimeForClip(clip: Clip, timelineTime: number): number {
  *   "up"    → reveals from top edge (top→bottom)
  *   "down"  → reveals from bottom edge (bottom→top)
  */
-function wipeRect(
+export function wipeRect(
   direction: string,
   progress: number,
   w: number,
@@ -149,7 +149,7 @@ function findActiveTransition(sortedClips: Clip[], t: number): ActiveTransition 
  * Both sources are drawn inside the same "contain" frame used by normal
  * playback, so the framing never jumps during a transition.
  */
-function drawTransitionPair(
+export function drawTransitionPair(
   ctx: CanvasRenderingContext2D,
   outSource: { source: CanvasImageSource | null; srcW: number; srcH: number; filter: string; baseAlpha: number },
   inSource: { source: CanvasImageSource | null; srcW: number; srcH: number; filter: string; baseAlpha: number },
@@ -242,7 +242,7 @@ function drawTransitionPair(
  * renderer so every place that places a media frame on the canvas agrees
  * exactly on the frame's bounds.
  */
-function containRect(
+export function containRect(
   srcWidth: number,
   srcHeight: number,
   canvasWidth: number,
@@ -284,8 +284,15 @@ export function useCompositor(
   // already used correctly by usePlaybackClock's tick function.
   const playheadSecRef = useRef(playheadSec);
   const isPlayingRef = useRef(isPlaying);
-  playheadSecRef.current = playheadSec;
-  isPlayingRef.current = isPlaying;
+  // Keep the refs in sync with the latest render values. Updating a ref is
+  // not allowed during render, so this happens inside an effect, which React
+  // runs synchronously before the browser paints / before the next animation
+  // frame. That ordering is what lets drawFrame read the freshest playhead and
+  // playing state from the refs without ever needing to be recreated.
+  useEffect(() => {
+    playheadSecRef.current = playheadSec;
+    isPlayingRef.current = isPlaying;
+  });
 
   // --- Element pool management: create/destroy hidden <video>/<img>
   // elements as assets are referenced by clips on the timeline. ---
@@ -367,6 +374,13 @@ export function useCompositor(
     }
   }, [project, hiddenHostRef]);
 
+  const findActiveClip = useCallback((track: Track, atSec: number): Clip | null => {
+    for (const clip of track.clips ?? []) {
+      if (atSec >= clip.timelineStartSec && atSec < clip.timelineEndSec) return clip;
+    }
+    return null;
+  }, []);
+
   // --- Play/pause: drive every active video element's native playback
   // (or paused) state so frames actually advance between our redraw calls.
   // When transitioning to playing we also nudge each already-decoded video
@@ -407,14 +421,7 @@ export function useCompositor(
         el.pause();
       }
     }
-  }, [isPlaying, project, playheadSec]);
-
-  const findActiveClip = useCallback((track: Track, atSec: number): Clip | null => {
-    for (const clip of track.clips ?? []) {
-      if (atSec >= clip.timelineStartSec && atSec < clip.timelineEndSec) return clip;
-    }
-    return null;
-  }, []);
+  }, [isPlaying, project, playheadSec, findActiveClip]);
 
   // --- The render loop itself. ---
   // drawFrame is a *stable* callback (its deps do NOT include playheadSec

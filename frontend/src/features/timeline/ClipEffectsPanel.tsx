@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { X, Sparkles, Trash2 } from "lucide-react";
 import { useEditorStore } from "../../stores/editorStore";
-import type { Effect, EffectType, TransitionType } from "../../types/project";
+import type { Effect, EffectType } from "../../types/project";
 
 interface ClipEffectsPanelProps {
   clipId: string;
@@ -21,15 +21,6 @@ const FILTER_EFFECTS: { type: EffectType; label: string; hint: string }[] = [
   { type: "grain", label: "Film Grain", hint: "Adds texture/noise" },
   { type: "vhs", label: "VHS", hint: "Retro tape look" },
   { type: "rgbshift", label: "RGB Shift", hint: "Chromatic aberration" },
-];
-
-const TRANSITION_TYPES: { type: TransitionType; label: string }[] = [
-  { type: "fade", label: "Fade" },
-  { type: "dissolve", label: "Dissolve" },
-  { type: "wipe", label: "Wipe" },
-  { type: "slide", label: "Slide" },
-  { type: "push", label: "Push" },
-  { type: "zoom", label: "Zoom" },
 ];
 
 function defaultParamKey(type: EffectType): string {
@@ -59,20 +50,18 @@ export function ClipEffectsPanel({ clipId, onClose }: ClipEffectsPanelProps) {
   const addEffect = useEditorStore((s) => s.addEffect);
   const updateEffect = useEditorStore((s) => s.updateEffect);
   const removeEffect = useEditorStore((s) => s.removeEffect);
-  const setTransition = useEditorStore((s) => s.setTransition);
-  const removeTransition = useEditorStore((s) => s.removeTransition);
 
   const found = useMemo(() => {
     if (!project) return null;
     for (const track of project.tracks) {
       const clip = (track.clips ?? []).find((c) => c.id === clipId);
-      if (clip) return { clip, track };
+      if (clip) return clip;
     }
     return null;
   }, [project, clipId]);
 
   if (!found) return null;
-  const { clip, track } = found;
+  const clip = found;
   const effects = clip.effects ?? [];
 
   const effectByType = (type: EffectType): Effect | undefined => effects.find((e) => e.type === type);
@@ -90,13 +79,6 @@ export function ClipEffectsPanel({ clipId, onClose }: ClipEffectsPanelProps) {
     if (effectByType(type)) return;
     addEffect(clip.id, { type, params: { [defaultParamKey(type)]: defaultAmount }, enabled: true });
   };
-
-  // Only clips starting after this one on the SAME track are valid
-  // transition targets - a transition dissolves/wipes into whatever
-  // plays next in that lane.
-  const nextClipCandidates = (track.clips ?? [])
-    .filter((c) => c.id !== clip.id && c.timelineStartSec >= clip.timelineEndSec - 0.001)
-    .sort((a, b) => a.timelineStartSec - b.timelineStartSec);
 
   return (
     <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60" onMouseDown={onClose}>
@@ -197,66 +179,8 @@ export function ClipEffectsPanel({ clipId, onClose }: ClipEffectsPanelProps) {
               })}
           </section>
 
-          {/* Transition into the next clip on this track */}
-          <section>
-            <h3 className="text-[11px] font-medium text-text-tertiary uppercase tracking-wide mb-2">Transition</h3>
-            {nextClipCandidates.length === 0 ? (
-              <p className="text-xs text-text-tertiary">No clip follows this one on {track.name} yet - add one to set a transition.</p>
-            ) : (
-              <div className="space-y-2">
-                <select
-                  value={clip.transition?.type ?? ""}
-                  onChange={(e) => {
-                    const value = e.target.value as TransitionType | "";
-                    if (!value) {
-                      if (clip.transition) removeTransition(clip.id);
-                      return;
-                    }
-                    setTransition(clip.id, {
-                      type: value,
-                      nextClipId: clip.transition?.nextClipId ?? nextClipCandidates[0].id,
-                      durationSec: clip.transition?.durationSec ?? 1,
-                    });
-                  }}
-                  className="w-full px-2.5 py-1.5 rounded-md bg-surface-1 border border-border-subtle text-xs text-text-primary outline-none focus:ring-1 focus:ring-accent"
-                >
-                  <option value="">Hard cut (no transition)</option>
-                  {TRANSITION_TYPES.map((t) => (
-                    <option key={t.type} value={t.type}>
-                      {t.label}
-                    </option>
-                  ))}
-                </select>
-
-                {clip.transition && (
-                  <div>
-                    <div className="flex items-center justify-between text-xs text-text-secondary mb-1">
-                      <span>Duration</span>
-                      <span className="font-mono-tabular text-text-tertiary">{clip.transition.durationSec.toFixed(1)}s</span>
-                    </div>
-                    <input
-                      type="range"
-                      min={0.2}
-                      max={3}
-                      step={0.1}
-                      value={clip.transition.durationSec}
-                      onChange={(e) =>
-                        setTransition(clip.id, {
-                          type: clip.transition!.type,
-                          nextClipId: clip.transition!.nextClipId,
-                          durationSec: Number(e.target.value),
-                        })
-                      }
-                      className="w-full accent-accent"
-                    />
-                  </div>
-                )}
-                <p className="text-[10px] text-text-tertiary leading-snug">
-                  Transition data saves with the project now; rendering it into the final exported video is still on the roadmap.
-                </p>
-              </div>
-            )}
-          </section>
+          {/* Transition into the next clip moved to the dedicated
+              transitions panel (see TransitionPanel.tsx) */}
         </div>
       </div>
     </div>

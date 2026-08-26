@@ -1,10 +1,11 @@
 import { useRef, useCallback, useEffect, useState } from "react";
-import { ZoomIn, ZoomOut, Scissors, Copy, Trash2, Type, Sparkles } from "lucide-react";
+import { ZoomIn, ZoomOut, Scissors, Copy, Trash2, Type, Sparkles, ArrowRightLeft } from "lucide-react";
 import { useEditorStore, timelineDurationSec } from "../../stores/editorStore";
 import { TimeRuler } from "./TimeRuler";
 import { TimelineTrack } from "./TimelineTrack";
 import { TextClipPanel } from "./TextClipPanel";
 import { ClipEffectsPanel } from "./ClipEffectsPanel";
+import { TransitionPanel } from "./TransitionPanel";
 
 export function Timeline() {
   const project = useEditorStore((s) => s.project);
@@ -26,6 +27,7 @@ export function Timeline() {
   const [clipboardClipId, setClipboardClipId] = useState<string | null>(null);
   const [editingTextClipId, setEditingTextClipId] = useState<string | null>(null);
   const [effectsClipId, setEffectsClipId] = useState<string | null>(null);
+  const [transitionClipId, setTransitionClipId] = useState<string | null>(null);
 
   const duration = timelineDurationSec(project);
   const totalWidth = Math.max(duration + 30, 60) * pixelsPerSecond + 200;
@@ -126,6 +128,21 @@ export function Timeline() {
       ? selectedClipId
       : null;
 
+  // A transition is only available on a video clip that has another clip
+  // starting right after it on the same track (the "A -> B" boundary).
+  const selectedTransitionClipId = (() => {
+    if (!selectedVideoClipId) return null;
+    for (const track of project.tracks) {
+      if (track.type !== "video") continue;
+      const clips = track.clips ?? [];
+      const sel = clips.find((c) => c.id === selectedVideoClipId);
+      if (!sel) continue;
+      const hasNext = clips.some((c) => c.id !== sel.id && c.timelineStartSec >= sel.timelineEndSec - 0.001);
+      return hasNext ? selectedVideoClipId : null;
+    }
+    return null;
+  })();
+
   // Sort tracks for display: video tracks highest-order-first (so track
   // "Video 2" visually sits above "Video 1", matching its compositing
   // priority), then text tracks, then audio tracks at the bottom -
@@ -181,10 +198,20 @@ export function Timeline() {
           onClick={() => selectedClipId && setEffectsClipId(selectedClipId)}
           disabled={!selectedVideoClipId}
           className="flex items-center gap-1.5 px-2 py-1 rounded text-text-secondary hover:text-text-primary hover:bg-surface-3 disabled:opacity-30 disabled:hover:bg-transparent transition-colors text-xs"
-          title="Effects: color correction, filters, transitions"
+          title="Effects: color correction, filters"
         >
           <Sparkles size={14} />
           Effects
+        </button>
+
+        <button
+          onClick={() => selectedClipId && setTransitionClipId(selectedClipId)}
+          disabled={!selectedTransitionClipId}
+          className="flex items-center gap-1.5 px-2 py-1 rounded text-text-secondary hover:text-text-primary hover:bg-surface-3 disabled:opacity-30 disabled:hover:bg-transparent transition-colors text-xs"
+          title="Add or edit the transition between this clip and the next"
+        >
+          <ArrowRightLeft size={14} />
+          Transition
         </button>
 
         <div className="flex-1" />
@@ -247,6 +274,7 @@ export function Timeline() {
 
       {editingTextClipId && <TextClipPanel clipId={editingTextClipId} onClose={() => setEditingTextClipId(null)} />}
       {effectsClipId && <ClipEffectsPanel clipId={effectsClipId} onClose={() => setEffectsClipId(null)} />}
+      {transitionClipId && <TransitionPanel clipId={transitionClipId} onClose={() => setTransitionClipId(null)} />}
     </div>
   );
 }
