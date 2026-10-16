@@ -199,6 +199,10 @@ export function createMockBackend(): EditorBackend {
       return mockSettings.projectsRootDir;
     },
 
+    async revealInFileManager() {
+      // no file manager to open in the browser mock
+    },
+
     async addClipToTrack(trackId, clipInput) {
       const track = project.tracks.find((t) => t.id === trackId);
       if (!track) throw new Error(`Track ${trackId} not found`);

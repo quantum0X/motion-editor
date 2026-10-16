@@ -62,7 +62,74 @@ input, textarea {
   font-variant-numeric: tabular-nums;
 }
 
-button:focus-visible, [tabindex]:focus-visible {
+button:focus-visible, [tabindex]:focus-visible, input[type="range"]:focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 1px;
+}
+
+button:disabled {
+  cursor: default;
+}
+
+/* Dialog entrance - quick enough to never feel like it's in the way. */
+@keyframes modal-backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes modal-content-in {
+  from { opacity: 0; transform: translateY(4px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+.modal-backdrop {
+  animation: modal-backdrop-in 120ms ease-out;
+}
+.modal-backdrop > * {
+  animation: modal-content-in 140ms ease-out;
+}
+
+/* Range sliders: thinner track and a visible thumb that matches the theme. */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 16px;
+  background: transparent;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--color-surface-3);
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: var(--color-text-primary);
+  border: 2px solid var(--color-accent);
+  transition: transform 80ms ease-out;
+}
+input[type="range"]:hover::-webkit-slider-thumb,
+input[type="range"]:active::-webkit-slider-thumb {
+  transform: scale(1.2);
+}
+input[type="range"]::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--color-surface-3);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--color-text-primary);
+  border: 2px solid var(--color-accent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }

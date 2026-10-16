@@ -347,4 +347,5 @@ type ExportProgress struct {
 	PercentDone  float64 `json:"percentDone"`
 	CurrentStage string  `json:"currentStage"` // "preparing" | "rendering" | "finalizing" | "done" | "error"
 	ErrorMessage string  `json:"errorMessage,omitempty"`
+	OutputPath   string  `json:"outputPath,omitempty"` // set on "done": absolute path of the rendered file
 }

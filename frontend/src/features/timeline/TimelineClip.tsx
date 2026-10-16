@@ -1,4 +1,5 @@
-import { useState, useRef, useCallback } from "react";
+import { memo, useState, useRef, useCallback } from "react";
+import { Sparkles } from "lucide-react";
 import type { Clip, MediaAsset, Track } from "../../types/project";
 import { useEditorStore } from "../../stores/editorStore";
 import { formatTimecode } from "../../utils/time";
@@ -12,31 +13,55 @@ interface TimelineClipProps {
   pixelsPerSecond: number;
   fps: number;
   isSelected: boolean;
-  onDoubleClick?: () => void;
+  onDoubleClick?: (clipId: string) => void;
 }
 
 type DragMode = "move" | "trim-left" | "trim-right" | null;
 
 const SNAP_THRESHOLD_PX = 8;
+// Movement below this is treated as a click (select), not a drag.
+const DRAG_THRESHOLD_PX = 3;
+const DROP_HIGHLIGHT = ["bg-accent/15", "ring-1", "ring-accent", "ring-inset"];
 
-export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelected, onDoubleClick }: TimelineClipProps) {
-  const selectClip = useEditorStore((s) => s.selectClip);
-  const moveClip = useEditorStore((s) => s.moveClip);
-  const trimClip = useEditorStore((s) => s.trimClip);
-  const project = useEditorStore((s) => s.project);
-  const playheadSec = useEditorStore((s) => s.playheadSec);
+/** Every other clip's edges (all tracks) plus the playhead - read once when a drag starts, not on every mousemove. */
+function collectSnapPoints(excludeClipId: string): number[] {
+  const { project, playheadSec } = useEditorStore.getState();
+  const points = new Set<number>([0, playheadSec]);
+  for (const t of project?.tracks ?? []) {
+    for (const c of t.clips ?? []) {
+      if (c.id === excludeClipId) continue;
+      points.add(c.timelineStartSec);
+      points.add(c.timelineEndSec);
+    }
+    for (const c of t.textClips ?? []) {
+      points.add(c.timelineStartSec);
+      points.add(c.timelineEndSec);
+    }
+  }
+  return Array.from(points);
+}
 
+function snap(timeSec: number, points: number[], pixelsPerSecond: number): { time: number; snapped: boolean } {
+  const thresholdSec = SNAP_THRESHOLD_PX / pixelsPerSecond;
+  let closest = timeSec;
+  let closestDist = Infinity;
+  for (const point of points) {
+    const dist = Math.abs(point - timeSec);
+    if (dist < thresholdSec && dist < closestDist) {
+      closest = point;
+      closestDist = dist;
+    }
+  }
+  return { time: closest, snapped: closest !== timeSec };
+}
+
+export const TimelineClip = memo(function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelected, onDoubleClick }: TimelineClipProps) {
   const [dragMode, setDragMode] = useState<DragMode>(null);
   const [isSnapped, setIsSnapped] = useState(false);
-  const dragStartRef = useRef<{ mouseX: number; clipStart: number; clipEnd: number } | null>(null);
   const [previewOffset, setPreviewOffset] = useState(0);
-  // Mirrors previewOffset but updated synchronously inside the
-  // mousemove handler. handleMouseUp is created once (inside the same
-  // handleMouseDown call) and added as a raw window event listener, so
-  // it closes over whatever `previewOffset` was AT MOUSEDOWN TIME -
-  // React state updates from handleMouseMove never reach that closure.
-  // Reading the ref instead (mutated directly, not through React state)
-  // gives handleMouseUp the actual live value when the drag ends.
+  // Mirrors previewOffset synchronously for the mouseup handler, which is
+  // created at mousedown and would otherwise only ever see the state
+  // value captured then (a real bug this ref was added to fix).
   const liveOffsetRef = useRef(0);
 
   const left = clip.timelineStartSec * pixelsPerSecond;
@@ -45,89 +70,60 @@ export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelec
   const isVideo = track.type === "video";
   const baseColor = isVideo ? "bg-track-video-clip" : "bg-track-audio-clip";
   const thumbnailUrl = useResolvedMediaUrl(asset?.thumbnailPath);
-
-  /** Collects every other clip's start/end (in seconds) across all tracks, plus the playhead, used for snap targets while dragging. */
-  const getSnapPoints = useCallback((): number[] => {
-    if (!project) return [0];
-    const points = new Set<number>([0, playheadSec]);
-    for (const t of project.tracks) {
-      for (const c of t.clips ?? []) {
-        if (c.id === clip.id) continue;
-        points.add(c.timelineStartSec);
-        points.add(c.timelineEndSec);
-      }
-    }
-    return Array.from(points);
-  }, [project, clip.id, playheadSec]);
-
-  const snapTime = useCallback(
-    (timeSec: number): { time: number; snapped: boolean } => {
-      const snapPoints = getSnapPoints();
-      const thresholdSec = SNAP_THRESHOLD_PX / pixelsPerSecond;
-      let closest = timeSec;
-      let closestDist = Infinity;
-      for (const point of snapPoints) {
-        const dist = Math.abs(point - timeSec);
-        if (dist < thresholdSec && dist < closestDist) {
-          closest = point;
-          closestDist = dist;
-        }
-      }
-      return { time: closest, snapped: closest !== timeSec };
-    },
-    [getSnapPoints, pixelsPerSecond]
-  );
+  const locked = track.locked;
 
   const handleMouseDown = useCallback(
-    (e: React.MouseEvent, mode: DragMode) => {
+    (e: React.MouseEvent, mode: Exclude<DragMode, null>) => {
+      if (e.button !== 0) return;
       e.stopPropagation();
-      selectClip(clip.id);
-      setDragMode(mode);
-      dragStartRef.current = { mouseX: e.clientX, clipStart: clip.timelineStartSec, clipEnd: clip.timelineEndSec };
+      useEditorStore.getState().selectClip(clip.id);
+      if (locked) return;
 
-      // Cross-track dragging (move mode only): track which track lane
-      // the cursor is currently over, so dropping on a different
-      // (type-compatible) track actually moves the clip there instead
-      // of only ever repositioning it in time on its original track.
+      const start = { mouseX: e.clientX, mouseY: e.clientY, clipStart: clip.timelineStartSec, clipEnd: clip.timelineEndSec };
+      const snapPoints = collectSnapPoints(clip.id);
+      let started = false;
       let hoveredTrackEl: HTMLElement | null = null;
-      const clearHighlight = () => {
-        hoveredTrackEl?.classList.remove("bg-accent/15", "ring-1", "ring-accent", "ring-inset");
+      const clearHighlight = () => hoveredTrackEl?.classList.remove(...DROP_HIGHLIGHT);
+      const isDropTarget = (el: HTMLElement | null) =>
+        !!el && el.dataset.trackType === track.type && el.dataset.trackId !== track.id && el.dataset.trackLocked !== "true";
+
+      const applyOffset = (offset: number, snapped: boolean) => {
+        liveOffsetRef.current = offset;
+        setPreviewOffset(offset);
+        setIsSnapped(snapped);
       };
 
       const handleMouseMove = (moveEvent: MouseEvent) => {
-        if (!dragStartRef.current) return;
-        const deltaPx = moveEvent.clientX - dragStartRef.current.mouseX;
+        const deltaPx = moveEvent.clientX - start.mouseX;
+        if (!started) {
+          if (mode === "move" && Math.hypot(deltaPx, moveEvent.clientY - start.mouseY) < DRAG_THRESHOLD_PX) return;
+          started = true;
+          setDragMode(mode);
+        }
         const deltaSec = deltaPx / pixelsPerSecond;
 
         if (mode === "move") {
+          // Cross-track dragging: highlight a compatible lane under the
+          // cursor; dropping there moves the clip to that track.
           const trackEl = findTrackElementAtPoint(moveEvent.clientX, moveEvent.clientY);
           if (trackEl !== hoveredTrackEl) {
             clearHighlight();
             hoveredTrackEl = trackEl;
+            if (isDropTarget(trackEl)) trackEl!.classList.add(...DROP_HIGHLIGHT);
           }
-          const compatible = hoveredTrackEl?.dataset.trackType === track.type && hoveredTrackEl?.dataset.trackId !== track.id;
-          if (compatible) hoveredTrackEl!.classList.add("bg-accent/15", "ring-1", "ring-accent", "ring-inset");
-
-          const rawStart = dragStartRef.current.clipStart + deltaSec;
-          const { time: snappedStart, snapped } = snapTime(Math.max(0, rawStart));
-          const offset = snappedStart - dragStartRef.current.clipStart;
-          liveOffsetRef.current = offset;
-          setPreviewOffset(offset);
-          setIsSnapped(snapped);
+          // Snap either edge of the clip, whichever is closer.
+          const length = start.clipEnd - start.clipStart;
+          const rawStart = Math.max(0, start.clipStart + deltaSec);
+          const byStart = snap(rawStart, snapPoints, pixelsPerSecond);
+          const byEnd = snap(rawStart + length, snapPoints, pixelsPerSecond);
+          const snappedStart = byStart.snapped ? byStart.time : byEnd.snapped ? Math.max(0, byEnd.time - length) : rawStart;
+          applyOffset(snappedStart - start.clipStart, byStart.snapped || byEnd.snapped);
         } else if (mode === "trim-left") {
-          const rawStart = dragStartRef.current.clipStart + deltaSec;
-          const { time: snappedStart, snapped } = snapTime(Math.max(0, Math.min(rawStart, dragStartRef.current.clipEnd - 0.1)));
-          const offset = snappedStart - dragStartRef.current.clipStart;
-          liveOffsetRef.current = offset;
-          setPreviewOffset(offset);
-          setIsSnapped(snapped);
-        } else if (mode === "trim-right") {
-          const rawEnd = dragStartRef.current.clipEnd + deltaSec;
-          const { time: snappedEnd, snapped } = snapTime(Math.max(dragStartRef.current.clipStart + 0.1, rawEnd));
-          const offset = snappedEnd - dragStartRef.current.clipEnd;
-          liveOffsetRef.current = offset;
-          setPreviewOffset(offset);
-          setIsSnapped(snapped);
+          const { time, snapped } = snap(Math.max(0, Math.min(start.clipStart + deltaSec, start.clipEnd - 0.1)), snapPoints, pixelsPerSecond);
+          applyOffset(time - start.clipStart, snapped);
+        } else {
+          const { time, snapped } = snap(Math.max(start.clipStart + 0.1, start.clipEnd + deltaSec), snapPoints, pixelsPerSecond);
+          applyOffset(time - start.clipEnd, snapped);
         }
       };
 
@@ -136,25 +132,18 @@ export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelec
         window.removeEventListener("mouseup", handleMouseUp);
         clearHighlight();
 
-        if (dragStartRef.current) {
+        if (started) {
           const finalOffset = liveOffsetRef.current;
-
+          const { moveClip, trimClip } = useEditorStore.getState();
           let targetTrackId = track.id;
           if (mode === "move") {
             const trackEl = findTrackElementAtPoint(upEvent.clientX, upEvent.clientY);
-            if (trackEl?.dataset.trackType === track.type && trackEl.dataset.trackId) {
-              targetTrackId = trackEl.dataset.trackId;
-            }
+            if (isDropTarget(trackEl)) targetTrackId = trackEl!.dataset.trackId!;
           }
-
           if (Math.abs(finalOffset) > 0.001 || targetTrackId !== track.id) {
-            if (mode === "move") {
-              moveClip(clip.id, targetTrackId, Math.max(0, dragStartRef.current.clipStart + finalOffset));
-            } else if (mode === "trim-left") {
-              trimClip(clip.id, dragStartRef.current.clipStart + finalOffset, -1);
-            } else if (mode === "trim-right") {
-              trimClip(clip.id, -1, dragStartRef.current.clipEnd + finalOffset);
-            }
+            if (mode === "move") moveClip(clip.id, targetTrackId, Math.max(0, start.clipStart + finalOffset));
+            else if (mode === "trim-left") trimClip(clip.id, start.clipStart + finalOffset, -1);
+            else trimClip(clip.id, -1, start.clipEnd + finalOffset);
           }
         }
 
@@ -162,13 +151,12 @@ export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelec
         setDragMode(null);
         setPreviewOffset(0);
         setIsSnapped(false);
-        dragStartRef.current = null;
       };
 
       window.addEventListener("mousemove", handleMouseMove);
       window.addEventListener("mouseup", handleMouseUp);
     },
-    [clip, track.id, track.type, pixelsPerSecond, selectClip, moveClip, trimClip, snapTime]
+    [clip.id, clip.timelineStartSec, clip.timelineEndSec, track.id, track.type, locked, pixelsPerSecond]
   );
 
   let displayLeft = left;
@@ -182,41 +170,53 @@ export function TimelineClip({ clip, track, asset, pixelsPerSecond, fps, isSelec
     displayWidth = width + previewOffset * pixelsPerSecond;
   }
 
+  const ring = dragMode && isSnapped ? "ring-2 ring-yellow-400" : isSelected ? "ring-2 ring-accent" : "ring-1 ring-black/30";
+  const effectCount = (clip.effects ?? []).filter((e) => e.enabled).length;
+
   return (
     <div
-      className={`absolute top-1 bottom-1 rounded-md overflow-hidden cursor-grab active:cursor-grabbing transition-shadow ${baseColor} ${
-        dragMode && isSnapped ? "ring-2 ring-yellow-400" : isSelected ? "ring-2 ring-accent" : "ring-1 ring-black/30"
-      }`}
+      className={`absolute top-1 bottom-1 rounded-md overflow-hidden ${baseColor} ${ring} ${
+        locked ? "cursor-not-allowed" : "cursor-grab active:cursor-grabbing"
+      } ${dragMode ? "z-30 shadow-lg opacity-90" : ""} ${clip.muted ? "saturate-50" : ""}`}
       style={{ left: displayLeft, width: Math.max(displayWidth, 4) }}
       onMouseDown={(e) => handleMouseDown(e, "move")}
       onClick={(e) => e.stopPropagation()}
       onDoubleClick={(e) => {
         e.stopPropagation();
-        onDoubleClick?.();
+        if (!locked) onDoubleClick?.(clip.id);
       }}
-      title={`${asset?.fileName ?? "Unknown"} — ${formatTimecode(clip.timelineStartSec, fps)} to ${formatTimecode(clip.timelineEndSec, fps)}`}
+      title={`${asset?.fileName ?? "Unknown"} — ${formatTimecode(clip.timelineStartSec, fps)} to ${formatTimecode(clip.timelineEndSec, fps)}${
+        isVideo ? "\nDouble-click for effects" : ""
+      }`}
     >
       {/* Thumbnail strip background for video clips */}
       {isVideo && thumbnailUrl && (
-        <div
-          className="absolute inset-0 opacity-40 bg-cover bg-center"
-          style={{ backgroundImage: `url(${thumbnailUrl})` }}
-        />
+        <div className="absolute inset-0 opacity-40 bg-repeat-x bg-contain bg-left" style={{ backgroundImage: `url(${thumbnailUrl})` }} />
       )}
 
-      <div className="relative h-full flex items-center px-2 pointer-events-none">
+      <div className="relative h-full flex items-start gap-1 px-2 pt-1 pointer-events-none">
         <span className="text-[11px] font-medium text-white/90 truncate drop-shadow">{asset?.fileName ?? "Unknown clip"}</span>
+        {effectCount > 0 && displayWidth > 80 && (
+          <span className="ml-auto shrink-0 flex items-center gap-0.5 text-[10px] text-white/80 bg-black/30 rounded px-1" title={`${effectCount} effect(s)`}>
+            <Sparkles size={9} />
+            {effectCount}
+          </span>
+        )}
       </div>
 
       {/* Trim handles */}
-      <div
-        className="absolute top-0 left-0 bottom-0 w-2 cursor-ew-resize hover:bg-white/20"
-        onMouseDown={(e) => handleMouseDown(e, "trim-left")}
-      />
-      <div
-        className="absolute top-0 right-0 bottom-0 w-2 cursor-ew-resize hover:bg-white/20"
-        onMouseDown={(e) => handleMouseDown(e, "trim-right")}
-      />
+      {!locked && (
+        <>
+          <div
+            className="absolute top-0 left-0 bottom-0 w-2 cursor-ew-resize hover:bg-white/25 border-l-2 border-transparent hover:border-white/60"
+            onMouseDown={(e) => handleMouseDown(e, "trim-left")}
+          />
+          <div
+            className="absolute top-0 right-0 bottom-0 w-2 cursor-ew-resize hover:bg-white/25 border-r-2 border-transparent hover:border-white/60"
+            onMouseDown={(e) => handleMouseDown(e, "trim-right")}
+          />
+        </>
+      )}
     </div>
   );
-}
+});

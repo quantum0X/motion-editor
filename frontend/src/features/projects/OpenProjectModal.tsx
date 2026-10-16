@@ -1,8 +1,9 @@
 import { useState, useEffect } from "react";
 import { X, FolderOpen, Clock } from "lucide-react";
-import { useEditorStore } from "../../stores/editorStore";
+import { useEditorStore, confirmDiscardUnsaved } from "../../stores/editorStore";
 import { createBackend } from "../../services";
 import type { RecentEntry } from "../../types/project";
+import { Modal } from "../../components/Modal";
 
 interface OpenProjectModalProps {
   onClose: () => void;
@@ -19,8 +20,8 @@ export function OpenProjectModal({ onClose }: OpenProjectModalProps) {
         const backend = await createBackend();
         const list = await backend.recentProjects();
         setRecents(list);
-      } catch (e: any) {
-        setError(e.message || String(e));
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
       } finally {
         setIsLoading(false);
       }
@@ -28,20 +29,20 @@ export function OpenProjectModal({ onClose }: OpenProjectModalProps) {
   }, []);
 
   const handleOpen = async (dir: string) => {
+    if (!confirmDiscardUnsaved()) return;
     setError(null);
-    try {
-      const backend = await createBackend();
-      const project = await backend.openProject(dir);
-      useEditorStore.getState().setProject(project);
-      onClose();
-    } catch (e: any) {
-      setError(e.message || String(e));
-    }
+    // Goes through the store (not setProject) so undo history, selection
+    // and the playhead reset - otherwise Ctrl+Z could "undo" back into the
+    // previously open project.
+    await useEditorStore.getState().openProjectFrom(dir);
+    const { lastError } = useEditorStore.getState();
+    if (lastError) setError(lastError);
+    else onClose();
   };
 
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60" onMouseDown={onClose}>
-      <div className="w-[420px] max-h-[70vh] rounded-lg bg-surface-2 border border-border-strong shadow-2xl p-5 flex flex-col" onMouseDown={(e) => e.stopPropagation()}>
+    <Modal onClose={onClose}>
+      <div className="w-[420px] max-h-[70vh] rounded-lg bg-surface-2 border border-border-strong shadow-2xl p-5 flex flex-col">
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-2 text-text-primary">
             <FolderOpen size={18} className="text-accent" />
@@ -82,6 +83,6 @@ export function OpenProjectModal({ onClose }: OpenProjectModalProps) {
           ))}
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

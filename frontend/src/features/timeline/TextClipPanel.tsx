@@ -1,7 +1,7 @@
-import { useState, useEffect } from "react";
 import { X, Trash2 } from "lucide-react";
 import { useEditorStore } from "../../stores/editorStore";
 import type { TextClip } from "../../types/project";
+import { Modal } from "../../components/Modal";
 
 interface TextClipPanelProps {
   clipId: string;
@@ -26,20 +26,13 @@ export function TextClipPanel({ clipId, onClose }: TextClipPanelProps) {
   const deleteSelectedTextClip = useEditorStore((s) => s.deleteSelectedTextClip);
   const selectTextClip = useEditorStore((s) => s.selectTextClip);
 
-  const clip = project?.tracks.flatMap((t) => t.textClips ?? []).find((c) => c.id === clipId);
-  const [draft, setDraft] = useState<TextClip | null>(clip ?? null);
-
-  useEffect(() => {
-    setDraft(clip ?? null);
-  }, [clip]);
-
+  // Edits apply to the store optimistically (and are synced/coalesced
+  // there), so the clip itself is the source of truth - no local draft
+  // that late backend responses could overwrite mid-typing.
+  const draft = project?.tracks.flatMap((t) => t.textClips ?? []).find((c) => c.id === clipId);
   if (!draft) return null;
 
-  const apply = (partial: Partial<TextClip>) => {
-    const updated = { ...draft, ...partial };
-    setDraft(updated);
-    updateTextClip(clipId, updated);
-  };
+  const apply = (partial: Partial<TextClip>) => updateTextClip(clipId, { ...draft, ...partial });
 
   const handleDelete = () => {
     selectTextClip(clipId);
@@ -48,18 +41,15 @@ export function TextClipPanel({ clipId, onClose }: TextClipPanelProps) {
   };
 
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60" onMouseDown={onClose}>
-      <div
-        className="w-[360px] rounded-lg bg-surface-2 border border-border-strong shadow-2xl p-5 max-h-[85vh] overflow-y-auto"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose}>
+      <div className="w-[360px] rounded-lg bg-surface-2 border border-border-strong shadow-2xl p-5 max-h-[85vh] overflow-y-auto">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-sm font-semibold text-text-primary">Edit Text</h2>
           <div className="flex items-center gap-2">
             <button onClick={handleDelete} className="text-text-tertiary hover:text-danger" title="Delete text clip">
               <Trash2 size={14} />
             </button>
-            <button onClick={onClose} className="text-text-tertiary hover:text-text-primary">
+            <button onClick={onClose} className="text-text-tertiary hover:text-text-primary" aria-label="Close">
               <X size={16} />
             </button>
           </div>
@@ -94,14 +84,15 @@ export function TextClipPanel({ clipId, onClose }: TextClipPanelProps) {
           </Field>
 
           <div className="grid grid-cols-2 gap-3">
-            <Field label="Size">
+            <Field label={`Size · ${draft.fontSize}px`}>
               <input
-                type="number"
+                type="range"
                 min={8}
                 max={200}
                 value={draft.fontSize}
-                onChange={(e) => apply({ fontSize: Number(e.target.value) || 32 })}
-                className="w-full px-3 py-1.5 rounded-md bg-surface-1 border border-border-subtle text-sm text-text-primary outline-none focus:ring-1 focus:ring-accent font-mono-tabular"
+                onChange={(e) => apply({ fontSize: Number(e.target.value) })}
+                className="w-full accent-accent mt-2"
+                aria-label="Font size"
               />
             </Field>
             <Field label="Weight">
@@ -130,8 +121,12 @@ export function TextClipPanel({ clipId, onClose }: TextClipPanelProps) {
                 className="w-9 h-9 rounded cursor-pointer bg-surface-1 border border-border-subtle"
               />
               <input
-                value={draft.color}
-                onChange={(e) => apply({ color: e.target.value })}
+                defaultValue={draft.color}
+                key={draft.color}
+                onBlur={(e) => /^#[0-9a-f]{6}$/i.test(e.target.value) && apply({ color: e.target.value })}
+                onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+                spellCheck={false}
+                aria-label="Hex color"
                 className="flex-1 px-3 py-1.5 rounded-md bg-surface-1 border border-border-subtle text-sm text-text-primary outline-none focus:ring-1 focus:ring-accent font-mono-tabular"
               />
             </div>
@@ -155,6 +150,18 @@ export function TextClipPanel({ clipId, onClose }: TextClipPanelProps) {
             </div>
           </Field>
 
+          <Field label={`Opacity · ${Math.round((draft.opacity ?? 1) * 100)}%`}>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              value={Math.round((draft.opacity ?? 1) * 100)}
+              onChange={(e) => apply({ opacity: Number(e.target.value) / 100 })}
+              className="w-full accent-accent"
+              aria-label="Opacity"
+            />
+          </Field>
+
           <div className="flex items-center justify-between pt-1">
             <ToggleField
               label="Outline"
@@ -169,7 +176,7 @@ export function TextClipPanel({ clipId, onClose }: TextClipPanelProps) {
           </div>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }
 

@@ -1019,10 +1019,9 @@ func mimeTypeFor(path string) string {
 // directly, bypassing custom asset-server handlers) - so this is the
 // one approach that doesn't need special-casing per run mode.
 //
-// It reads the whole file into memory, which is fine for the clip
-// lengths this editor currently targets; if very large source files
-// become a real use case, this should become a streamed, range-request
-// capable HTTP approach instead.
+// It reads the whole file into memory, so it is now only a fallback: the
+// frontend prefers the streamed, range-capable /localmedia route (see
+// mediaserver.go) and uses this only if that route is unreachable.
 func (a *App) ReadMediaFileAsDataURL(path string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -1088,10 +1087,10 @@ func (a *App) OpenFileDialog() ([]string, error) {
 //
 // Export runs as a background goroutine so the Wails-bound call returns
 // immediately (the frontend gets a jobID back right away); progress and
-// completion are pushed to the frontend via Wails events
-// ("export:progress", "export:done", "export:error") rather than the
-// frontend polling, since ffmpeg's own -progress output arrives as a
-// stream, not a single final value.
+// completion are pushed to the frontend via a single Wails event,
+// "export:progress" (CurrentStage "done"/"error" marks the end), rather
+// than the frontend polling, since ffmpeg's own -progress output arrives
+// as a stream, not a single final value.
 
 func (a *App) StartExport(settings models.ExportSettings) (string, error) {
 	proj := a.projectSvc.CurrentProject()
@@ -1103,6 +1102,14 @@ func (a *App) StartExport(settings models.ExportSettings) (string, error) {
 	if a.exportCancel != nil {
 		a.exportMu.Unlock()
 		return "", fmt.Errorf("an export is already running - cancel it before starting another")
+	}
+
+	// A relative output path would otherwise resolve against the process
+	// working directory, which for a desktop app launched from a shortcut
+	// is effectively arbitrary (often the install dir or System32).
+	// Anchor it to the open project's folder instead.
+	if !filepath.IsAbs(settings.OutputPath) {
+		settings.OutputPath = filepath.Join(a.projectSvc.CurrentProjectDir(), settings.OutputPath)
 	}
 
 	plan, err := export.Plan(proj, settings)
@@ -1150,7 +1157,7 @@ func (a *App) runExport(ctx context.Context, jobID string, plan *export.ExportPl
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		runtime.EventsEmit(a.ctx, "export:error", models.ExportProgress{
+		runtime.EventsEmit(a.ctx, "export:progress", models.ExportProgress{
 			JobID: jobID, CurrentStage: "error", ErrorMessage: fmt.Sprintf("failed to attach to ffmpeg output: %v", err),
 		})
 		return
@@ -1163,7 +1170,7 @@ func (a *App) runExport(ctx context.Context, jobID string, plan *export.ExportPl
 	cmd.Stderr = &stderrBuf
 
 	if err := cmd.Start(); err != nil {
-		runtime.EventsEmit(a.ctx, "export:error", models.ExportProgress{
+		runtime.EventsEmit(a.ctx, "export:progress", models.ExportProgress{
 			JobID: jobID, CurrentStage: "error", ErrorMessage: fmt.Sprintf("failed to start ffmpeg: %v", err),
 		})
 		return
@@ -1196,13 +1203,13 @@ func (a *App) runExport(ctx context.Context, jobID string, plan *export.ExportPl
 
 	err = cmd.Wait()
 	if ctx.Err() != nil {
-		runtime.EventsEmit(a.ctx, "export:error", models.ExportProgress{
+		runtime.EventsEmit(a.ctx, "export:progress", models.ExportProgress{
 			JobID: jobID, CurrentStage: "error", ErrorMessage: "export cancelled",
 		})
 		return
 	}
 	if err != nil {
-		runtime.EventsEmit(a.ctx, "export:error", models.ExportProgress{
+		runtime.EventsEmit(a.ctx, "export:progress", models.ExportProgress{
 			JobID: jobID, CurrentStage: "error",
 			ErrorMessage: fmt.Sprintf("ffmpeg exited with an error: %v\n%s", err, lastLines(stderrBuf.String(), 20)),
 		})
@@ -1210,7 +1217,7 @@ func (a *App) runExport(ctx context.Context, jobID string, plan *export.ExportPl
 	}
 
 	runtime.EventsEmit(a.ctx, "export:progress", models.ExportProgress{
-		JobID: jobID, PercentDone: 100, CurrentStage: "done",
+		JobID: jobID, PercentDone: 100, CurrentStage: "done", OutputPath: settings.OutputPath,
 	})
 }
 
@@ -1259,7 +1266,16 @@ func main() {
 		Width:  1440,
 		Height: 900,
 		AssetServer: &assetserver.Options{
-			Assets: assets,
+			Assets:     assets,
+			Middleware: app.mediaMiddleware,
+		},
+		// Native OS file drops: the webview only exposes sandboxed File
+		// objects (no real paths) to HTML drop events, which the Go media
+		// importer can't open. Wails' own file-drop handler delivers real
+		// absolute paths instead (see MediaLibrary.tsx / OnFileDrop).
+		DragAndDrop: &options.DragAndDrop{
+			EnableFileDrop:     true,
+			DisableWebViewDrop: true,
 		},
 		BackgroundColour: &options.RGBA{R: 18, G: 18, B: 20, A: 1},
 		OnStartup:        app.startup,

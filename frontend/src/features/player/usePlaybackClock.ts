@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { useEditorStore, timelineDurationSec } from "../../stores/editorStore";
 
 /**
@@ -15,49 +15,35 @@ import { useEditorStore, timelineDurationSec } from "../../stores/editorStore";
  */
 export function usePlaybackClock() {
   const isPlaying = useEditorStore((s) => s.isPlaying);
-  const project = useEditorStore((s) => s.project);
-  const setPlayhead = useEditorStore((s) => s.setPlayhead);
-  const setIsPlaying = useEditorStore((s) => s.setIsPlaying);
-
-  const lastTickRef = useRef<number | null>(null);
-  const rafRef = useRef<number | null>(null);
 
   useEffect(() => {
-    if (!isPlaying) {
-      lastTickRef.current = null;
-      return;
-    }
+    if (!isPlaying) return;
+
+    let raf = 0;
+    let lastTick: number | null = null;
 
     const tick = (now: number) => {
-      if (lastTickRef.current === null) {
-        lastTickRef.current = now;
-      }
-      const deltaSec = (now - lastTickRef.current) / 1000;
-      lastTickRef.current = now;
+      const deltaSec = lastTick === null ? 0 : (now - lastTick) / 1000;
+      lastTick = now;
 
+      // Read fresh each tick (not captured when the effect started) so
+      // edits made during playback - e.g. a clip added past the old end -
+      // extend playback instead of stopping at a stale duration.
+      const { project, playheadSec, setPlayhead, setIsPlaying } = useEditorStore.getState();
       const duration = timelineDurationSec(project);
-      const current = useEditorStore.getState().playheadSec;
-      const next = current + deltaSec;
+      const next = playheadSec + deltaSec;
 
-      if (duration > 0 && next >= duration) {
-        setPlayhead(duration);
+      if (duration <= 0 || next >= duration) {
+        setPlayhead(Math.max(0, duration));
         setIsPlaying(false);
         return;
       }
 
       setPlayhead(next);
-      rafRef.current = requestAnimationFrame(tick);
+      raf = requestAnimationFrame(tick);
     };
 
-    rafRef.current = requestAnimationFrame(tick);
-    return () => {
-      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
-    };
-    // project is read fresh inside tick() via the store getter rather
-    // than captured in the closure, so we don't need it as a dependency
-    // here (re-subscribing the whole RAF loop on every project mutation
-    // during playback, e.g. nothing should change mid-scrub, would be
-    // wasteful and could cause stutter).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
   }, [isPlaying]);
 }

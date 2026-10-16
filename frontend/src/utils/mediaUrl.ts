@@ -8,23 +8,47 @@ export function isDirectlyLoadableUrl(path: string): boolean {
 
 const cache = new Map<string, Promise<string>>();
 
+function isWailsRuntime(): boolean {
+  return typeof window !== "undefined" && !!(window as { go?: { main?: { App?: unknown } } }).go?.main?.App;
+}
+
+/** Streamed, range-capable URL for a project file - served by mediaserver.go. */
+function streamUrlFor(path: string): string {
+  return `/localmedia?path=${encodeURIComponent(path)}`;
+}
+
+let streamingSupported: Promise<boolean> | null = null;
+
+/**
+ * Checks once per session whether the Go /localmedia route is reachable
+ * (it should be in both `wails dev` and a built app). If something in the
+ * webview/asset-server chain gets in the way - e.g. the dev server's SPA
+ * fallback answering with index.html - we fall back to the slower
+ * data: URL path rather than showing a black preview.
+ */
+function checkStreamingSupported(samplePath: string): Promise<boolean> {
+  if (!streamingSupported) {
+    streamingSupported = fetch(streamUrlFor(samplePath), { method: "HEAD" })
+      // Any non-HTML answer (even a 404 for a since-deleted file, which
+      // mediaserver.go sends as text/plain) proves the route itself works.
+      .then((res) => !(res.headers.get("content-type") ?? "").includes("text/html"))
+      .catch(() => false);
+  }
+  return streamingSupported;
+}
+
 /**
  * Resolves a MediaAsset's `filePath`/`thumbnailPath` (a plain absolute
  * filesystem path, as stored by the real Go backend) into a URL a
  * <video>/<audio>/<img> element or canvas can actually load.
  *
- * Why this is needed at all: a bare OS path like
- * "/home/alice/Videos/clip.mp4" is not a valid URL, and Wails' asset
- * server only serves the embedded frontend bundle - it has no built-in
- * route for arbitrary local files. Without this, every video and every
- * thumbnail in the real (non-mock) app renders as nothing at all - a
- * permanently black canvas / broken image - no matter what else is
- * correct. This calls the `ReadMediaFileAsDataURL` Go binding (see
- * app.go for why that's an IPC-bound method rather than an HTTP route)
- * and caches the result per path, since the same source file is reused
- * across every clip that references it (see useCompositor.ts) and
- * across the media library thumbnail + every timeline clip's thumbnail
- * for that same asset.
+ * A bare OS path like "C:\Videos\clip.mp4" is not a valid URL, so in the
+ * Wails app this points elements at the Go asset-server route
+ * `/localmedia` (see mediaserver.go), which streams the file with HTTP
+ * Range support - videos start playing and seeking immediately instead
+ * of waiting for the whole file to be base64-encoded across IPC. Results
+ * are cached per path, since the same source file is reused by every clip
+ * and thumbnail that references it.
  */
 export async function resolveMediaUrl(path: string): Promise<string> {
   if (!path) return path;
@@ -34,6 +58,9 @@ export async function resolveMediaUrl(path: string): Promise<string> {
   if (cached) return cached;
 
   const promise = (async () => {
+    if (isWailsRuntime() && (await checkStreamingSupported(path))) {
+      return streamUrlFor(path);
+    }
     const backend = await createBackend();
     return backend.readMediaFileAsDataUrl(path);
   })();

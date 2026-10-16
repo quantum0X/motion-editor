@@ -9,6 +9,7 @@ interface MenuBarProps {
   onShowSettings: () => void;
   onShowNewProject: () => void;
   onShowOpenProject: () => void;
+  onShowShortcuts: () => void;
 }
 
 /**
@@ -22,7 +23,7 @@ interface MenuBarProps {
  * callbacks since they're owned by EditorLayout's local UI state rather
  * than global store state.
  */
-export function MenuBar({ onShowExport, onShowSettings, onShowNewProject, onShowOpenProject }: MenuBarProps) {
+export function MenuBar({ onShowExport, onShowSettings, onShowNewProject, onShowOpenProject, onShowShortcuts }: MenuBarProps) {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
 
   const project = useEditorStore((s) => s.project);
@@ -30,9 +31,10 @@ export function MenuBar({ onShowExport, onShowSettings, onShowNewProject, onShow
   const selectedTextClipId = useEditorStore((s) => s.selectedTextClipId);
   const saveProject = useEditorStore((s) => s.saveProject);
   const splitClipAt = useEditorStore((s) => s.splitClipAt);
-  const playheadSec = useEditorStore((s) => s.playheadSec);
-  const deleteSelectedClip = useEditorStore((s) => s.deleteSelectedClip);
-  const deleteSelectedTextClip = useEditorStore((s) => s.deleteSelectedTextClip);
+  const deleteSelection = useEditorStore((s) => s.deleteSelection);
+  const copySelectedClip = useEditorStore((s) => s.copySelectedClip);
+  const pasteAtPlayhead = useEditorStore((s) => s.pasteAtPlayhead);
+  const hasClipboard = useEditorStore((s) => s.clipboard !== null);
   const duplicateSelectedClip = useEditorStore((s) => s.duplicateSelectedClip);
   const setZoom = useEditorStore((s) => s.setZoom);
   const pixelsPerSecond = useEditorStore((s) => s.pixelsPerSecond);
@@ -55,22 +57,18 @@ export function MenuBar({ onShowExport, onShowSettings, onShowNewProject, onShow
       }
       const updated = await backend.saveProjectAs(name, parentDir);
       useEditorStore.getState().setProject(updated);
-    } catch (e: any) {
-      useEditorStore.getState().setError(e.message || String(e));
+      useEditorStore.setState({ isDirty: false });
+    } catch (e) {
+      useEditorStore.getState().setError(e instanceof Error ? e.message : String(e));
     }
   }, [project]);
 
   const handleRevealProjectFolder = useCallback(async () => {
-    // Best-effort: not every platform/Wails version exposes a direct
-    // "reveal in file manager" runtime call in this app's current
-    // bindings, so this surfaces the path for the person to navigate to
-    // manually rather than silently doing nothing.
     try {
       const backend = await createBackend();
-      const dir = await backend.getProjectsRootDir();
-      window.alert(`Projects are stored in:\n${dir}`);
-    } catch (e: any) {
-      useEditorStore.getState().setError(e.message || String(e));
+      await backend.revealInFileManager("");
+    } catch (e) {
+      useEditorStore.getState().setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
 
@@ -83,7 +81,7 @@ export function MenuBar({ onShowExport, onShowSettings, onShowNewProject, onShow
     { divider: true, label: "" },
     { label: "Export...", shortcut: "Ctrl+E", onClick: onShowExport, disabled: !project },
     { divider: true, label: "" },
-    { label: "Show Project Folder", onClick: handleRevealProjectFolder },
+    { label: "Show Project Folder", onClick: handleRevealProjectFolder, disabled: !project },
     { label: "Change Projects Location...", onClick: onShowSettings },
   ];
 
@@ -95,8 +93,13 @@ export function MenuBar({ onShowExport, onShowSettings, onShowNewProject, onShow
       label: "Split at Playhead",
       shortcut: "S",
       disabled: !selectedClipId,
-      onClick: () => selectedClipId && splitClipAt(selectedClipId, playheadSec),
+      // Read at click time - subscribing to playheadSec here would re-render
+      // the whole menu bar every frame during playback.
+      onClick: () => selectedClipId && splitClipAt(selectedClipId, useEditorStore.getState().playheadSec),
     },
+    { divider: true, label: "" },
+    { label: "Copy", shortcut: "Ctrl+C", disabled: !selectedClipId, onClick: () => copySelectedClip() },
+    { label: "Paste at Playhead", shortcut: "Ctrl+V", disabled: !hasClipboard, onClick: () => pasteAtPlayhead() },
     {
       label: "Duplicate",
       shortcut: "Ctrl+D",
@@ -108,26 +111,18 @@ export function MenuBar({ onShowExport, onShowSettings, onShowNewProject, onShow
       shortcut: "Del",
       disabled: !selectedClipId && !selectedTextClipId,
       danger: true,
-      onClick: () => {
-        if (selectedClipId) deleteSelectedClip();
-        if (selectedTextClipId) deleteSelectedTextClip();
-      },
+      onClick: () => deleteSelection(),
     },
   ];
 
   const viewMenu: MenuItemDef[] = [
-    { label: "Zoom In", shortcut: "Ctrl++", onClick: () => setZoom(pixelsPerSecond * 1.4) },
+    { label: "Zoom In", shortcut: "Ctrl+=", onClick: () => setZoom(pixelsPerSecond * 1.4) },
     { label: "Zoom Out", shortcut: "Ctrl+-", onClick: () => setZoom(pixelsPerSecond / 1.4) },
-    { label: "Reset Zoom", onClick: () => setZoom(60) },
-  ];
-
-  const projectMenu: MenuItemDef[] = [
-    { label: "Project Settings...", disabled: !project, onClick: () => window.alert("Project settings panel coming in a later phase.") },
-    { label: "Canvas Resolution & FPS", disabled: true },
+    { label: "Reset Zoom", shortcut: "Ctrl+0", onClick: () => setZoom(60) },
   ];
 
   const helpMenu: MenuItemDef[] = [
-    { label: "Keyboard Shortcuts", onClick: () => window.alert("Space: Play/Pause\nS: Split at playhead\nDel: Delete selected\nCtrl+D: Duplicate\nCtrl+S: Save\n←/→: Step one frame") },
+    { label: "Keyboard Shortcuts", shortcut: "?", onClick: onShowShortcuts },
     { label: "About VideoEditor", onClick: () => window.alert("VideoEditor — built with Wails + React") },
   ];
 
@@ -137,7 +132,6 @@ export function MenuBar({ onShowExport, onShowSettings, onShowNewProject, onShow
       <MenuDropdown label="File" items={fileMenu} isOpen={openMenu === "file"} onOpen={() => handleOpen("file")} onClose={handleClose} />
       <MenuDropdown label="Edit" items={editMenu} isOpen={openMenu === "edit"} onOpen={() => handleOpen("edit")} onClose={handleClose} />
       <MenuDropdown label="View" items={viewMenu} isOpen={openMenu === "view"} onOpen={() => handleOpen("view")} onClose={handleClose} />
-      <MenuDropdown label="Project" items={projectMenu} isOpen={openMenu === "project"} onOpen={() => handleOpen("project")} onClose={handleClose} />
       <MenuDropdown label="Help" items={helpMenu} isOpen={openMenu === "help"} onOpen={() => handleOpen("help")} onClose={handleClose} />
     </div>
   );

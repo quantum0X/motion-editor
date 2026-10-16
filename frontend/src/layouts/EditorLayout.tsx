@@ -9,9 +9,21 @@ import { OpenProjectModal } from "../features/projects/OpenProjectModal";
 import { SettingsModal } from "../features/projects/SettingsModal";
 import { ExportPanel } from "../features/export/ExportPanel";
 import { PanelErrorBoundary } from "../components/PanelErrorBoundary";
+import { ShortcutsModal } from "./ShortcutsModal";
+import { useEditorShortcuts } from "./useEditorShortcuts";
+import { useEditorStore } from "../stores/editorStore";
 
 const MEDIA_WIDTH_KEY = "editor-media-library-width";
 const TIMELINE_HEIGHT_KEY = "editor-timeline-height";
+const AUTOSAVE_INTERVAL_MS = 60_000;
+
+function persistNumber(key: string, value: number) {
+  try {
+    window.localStorage?.setItem(key, String(value));
+  } catch {
+    /* ignore - purely a UX nicety */
+  }
+}
 
 function loadPersistedNumber(key: string, fallback: number): number {
   try {
@@ -32,7 +44,7 @@ function loadPersistedNumber(key: string, fallback: number): number {
  * dragging vertically. Kept intentionally simple (no external resizer
  * library) since only two dividers exist in this layout.
  */
-function ResizeHandle({ axis, onResize }: { axis: "x" | "y"; onResize: (deltaPx: number) => void }) {
+function ResizeHandle({ axis, onResize, onResizeEnd }: { axis: "x" | "y"; onResize: (deltaPx: number) => void; onResizeEnd: () => void }) {
   const dragging = useRef(false);
   const lastPos = useRef(0);
 
@@ -45,7 +57,9 @@ function ResizeHandle({ axis, onResize }: { axis: "x" | "y"; onResize: (deltaPx:
       onResize(delta);
     };
     const handleUp = () => {
+      if (!dragging.current) return;
       dragging.current = false;
+      onResizeEnd();
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
@@ -55,7 +69,7 @@ function ResizeHandle({ axis, onResize }: { axis: "x" | "y"; onResize: (deltaPx:
       window.removeEventListener("mousemove", handleMove);
       window.removeEventListener("mouseup", handleUp);
     };
-  }, [axis, onResize]);
+  }, [axis, onResize, onResizeEnd]);
 
   const handleDown = useCallback(
     (e: React.MouseEvent) => {
@@ -70,13 +84,20 @@ function ResizeHandle({ axis, onResize }: { axis: "x" | "y"; onResize: (deltaPx:
   return (
     <div
       onMouseDown={handleDown}
+      role="separator"
+      aria-orientation={axis === "x" ? "vertical" : "horizontal"}
       className={
         axis === "x"
-          ? "w-1 shrink-0 cursor-col-resize hover:bg-accent/50 active:bg-accent transition-colors"
-          : "h-1 shrink-0 cursor-row-resize hover:bg-accent/50 active:bg-accent transition-colors"
+          ? "w-1 shrink-0 cursor-col-resize bg-border-subtle hover:bg-accent/60 active:bg-accent transition-colors"
+          : "h-1 shrink-0 cursor-row-resize bg-border-subtle hover:bg-accent/60 active:bg-accent transition-colors"
       }
     />
   );
+}
+
+interface WailsDropRuntime {
+  OnFileDrop?: (callback: (x: number, y: number, paths: string[]) => void, useDropTarget: boolean) => void;
+  OnFileDropOff?: () => void;
 }
 
 export function EditorLayout() {
@@ -84,34 +105,55 @@ export function EditorLayout() {
   const [showOpenProject, setShowOpenProject] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showExport, setShowExport] = useState(false);
+  const [showShortcuts, setShowShortcuts] = useState(false);
 
   const [mediaWidth, setMediaWidth] = useState(() => loadPersistedNumber(MEDIA_WIDTH_KEY, 288));
   const [timelineHeight, setTimelineHeight] = useState(() => loadPersistedNumber(TIMELINE_HEIGHT_KEY, 288));
 
   const handleMediaResize = useCallback((delta: number) => {
-    setMediaWidth((w) => {
-      const next = Math.min(560, Math.max(200, w + delta));
-      try {
-        window.localStorage?.setItem(MEDIA_WIDTH_KEY, String(next));
-      } catch {
-        /* ignore */
-      }
-      return next;
-    });
+    setMediaWidth((w) => Math.min(560, Math.max(200, w + delta)));
   }, []);
 
   const handleTimelineResize = useCallback((delta: number) => {
     // Dragging the handle up (negative deltaY) should grow the timeline,
     // since the timeline sits below it.
-    setTimelineHeight((h) => {
-      const next = Math.min(window.innerHeight - 200, Math.max(160, h - delta));
-      try {
-        window.localStorage?.setItem(TIMELINE_HEIGHT_KEY, String(next));
-      } catch {
-        /* ignore */
-      }
-      return next;
-    });
+    setTimelineHeight((h) => Math.min(window.innerHeight - 200, Math.max(160, h - delta)));
+  }, []);
+
+  // Persist sizes once per drag rather than on every mousemove.
+  const mediaWidthRef = useRef(mediaWidth);
+  const timelineHeightRef = useRef(timelineHeight);
+  useEffect(() => {
+    mediaWidthRef.current = mediaWidth;
+    timelineHeightRef.current = timelineHeight;
+  });
+  const persistMediaWidth = useCallback(() => persistNumber(MEDIA_WIDTH_KEY, mediaWidthRef.current), []);
+  const persistTimelineHeight = useCallback(() => persistNumber(TIMELINE_HEIGHT_KEY, timelineHeightRef.current), []);
+
+  useEditorShortcuts({
+    onNewProject: () => setShowNewProject(true),
+    onOpenProject: () => setShowOpenProject(true),
+    onExport: () => setShowExport(true),
+    onShowShortcuts: () => setShowShortcuts(true),
+  });
+
+  // Periodic crash-recovery autosave (writes <project>/cache/autosave.json,
+  // separate from the real project file) while there are unsaved changes.
+  useEffect(() => {
+    const id = window.setInterval(() => useEditorStore.getState().autoSave(), AUTOSAVE_INTERVAL_MS);
+    return () => window.clearInterval(id);
+  }, []);
+
+  // Native file drops (Wails only): the webview's own HTML drop events
+  // only expose sandboxed File objects without real paths, which the Go
+  // importer can't read - Wails' OnFileDrop delivers absolute paths.
+  useEffect(() => {
+    const runtime = (window as { runtime?: WailsDropRuntime }).runtime;
+    if (!runtime?.OnFileDrop) return;
+    runtime.OnFileDrop((_x, _y, paths) => {
+      if (paths.length > 0) useEditorStore.getState().importFiles(paths);
+    }, false);
+    return () => runtime.OnFileDropOff?.();
   }, []);
 
   return (
@@ -121,6 +163,7 @@ export function EditorLayout() {
         onShowSettings={() => setShowSettings(true)}
         onShowNewProject={() => setShowNewProject(true)}
         onShowOpenProject={() => setShowOpenProject(true)}
+        onShowShortcuts={() => setShowShortcuts(true)}
       />
       <Toolbar onShowExport={() => setShowExport(true)} />
       <div className="flex flex-1 min-h-0">
@@ -129,15 +172,15 @@ export function EditorLayout() {
             <MediaLibrary />
           </PanelErrorBoundary>
         </div>
-        <ResizeHandle axis="x" onResize={handleMediaResize} />
+        <ResizeHandle axis="x" onResize={handleMediaResize} onResizeEnd={persistMediaWidth} />
         <div className="flex-1 min-h-0 min-w-0">
           <PanelErrorBoundary label="preview">
             <Player />
           </PanelErrorBoundary>
         </div>
       </div>
-      <ResizeHandle axis="y" onResize={handleTimelineResize} />
-      <div style={{ height: timelineHeight }} className="border-t border-border-subtle min-h-0 shrink-0">
+      <ResizeHandle axis="y" onResize={handleTimelineResize} onResizeEnd={persistTimelineHeight} />
+      <div style={{ height: timelineHeight }} className="min-h-0 shrink-0">
         <PanelErrorBoundary label="timeline">
           <Timeline />
         </PanelErrorBoundary>
@@ -147,6 +190,7 @@ export function EditorLayout() {
       {showOpenProject && <OpenProjectModal onClose={() => setShowOpenProject(false)} />}
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
       {showExport && <ExportPanel onClose={() => setShowExport(false)} />}
+      {showShortcuts && <ShortcutsModal onClose={() => setShowShortcuts(false)} />}
     </div>
   );
 }

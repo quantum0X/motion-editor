@@ -49,6 +49,8 @@ export interface EditorBackend {
   setProjectsRootDir(dir: string): Promise<AppSettings>;
   openDirectoryDialog(): Promise<string>;
   getProjectsRootDir(): Promise<string>;
+  // Opens the OS file manager at a file or folder ("" = current project folder).
+  revealInFileManager(path: string): Promise<void>;
 
   // Timeline mutation
   addClipToTrack(trackId: string, clip: Partial<Clip> & Pick<Clip, "assetId" | "trackId" | "timelineStartSec" | "timelineEndSec" | "sourceInSec" | "sourceOutSec">): Promise<Project>;

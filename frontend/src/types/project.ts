@@ -140,6 +140,7 @@ export interface ExportProgress {
   percentDone: number;
   currentStage: "preparing" | "rendering" | "finalizing" | "done" | "error";
   errorMessage?: string;
+  outputPath?: string; // set on "done": absolute path of the rendered file
 }
 
 export interface RecentEntry {

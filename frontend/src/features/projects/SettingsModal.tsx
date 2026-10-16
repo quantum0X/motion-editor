@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { X, FolderOpen } from "lucide-react";
 import { createBackend } from "../../services";
+import { Modal } from "../../components/Modal";
 
 interface SettingsModalProps {
   onClose: () => void;
@@ -26,8 +27,8 @@ export function SettingsModal({ onClose }: SettingsModalProps) {
         const backend = await createBackend();
         const dir = await backend.getProjectsRootDir();
         setCurrentDir(dir);
-      } catch (e: any) {
-        setError(e.message || String(e));
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
       }
     })();
   }, []);
@@ -43,16 +44,16 @@ export function SettingsModal({ onClose }: SettingsModalProps) {
       setCurrentDir(settings.projectsRootDir);
       setSavedMessage(true);
       setTimeout(() => setSavedMessage(false), 2000);
-    } catch (e: any) {
-      setError(e.message || String(e));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setIsSaving(false);
     }
   }, []);
 
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60" onMouseDown={onClose}>
-      <div className="w-[420px] rounded-lg bg-surface-2 border border-border-strong shadow-2xl p-5" onMouseDown={(e) => e.stopPropagation()}>
+    <Modal onClose={onClose}>
+      <div className="w-[420px] rounded-lg bg-surface-2 border border-border-strong shadow-2xl p-5">
         <div className="flex items-center justify-between mb-4">
           <span className="text-sm font-semibold text-text-primary">Projects Location</span>
           <button onClick={onClose} className="text-text-tertiary hover:text-text-primary">
@@ -82,6 +83,6 @@ export function SettingsModal({ onClose }: SettingsModalProps) {
           {isSaving ? "Saving..." : "Choose New Location..."}
         </button>
       </div>
-    </div>
+    </Modal>
   );
 }

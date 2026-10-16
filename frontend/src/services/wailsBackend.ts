@@ -23,6 +23,7 @@ declare global {
           SetProjectsRootDir(dir: string): Promise<AppSettings>;
           OpenDirectoryDialog(): Promise<string>;
           GetProjectsRootDir(): Promise<string>;
+          RevealInFileManager(path: string): Promise<void>;
           AddClipToTrack(trackId: string, clip: Partial<Clip>): Promise<Project>;
           MoveClip(clipId: string, newTrackId: string, newStart: number): Promise<Project>;
           TrimClip(clipId: string, newStart: number, newEnd: number): Promise<Project>;
@@ -69,6 +70,7 @@ export function createWailsBackend(): EditorBackend {
     setProjectsRootDir: (dir) => api.SetProjectsRootDir(dir),
     openDirectoryDialog: () => api.OpenDirectoryDialog(),
     getProjectsRootDir: () => api.GetProjectsRootDir(),
+    revealInFileManager: (path) => api.RevealInFileManager(path),
 
     addClipToTrack: (trackId, clip) => api.AddClipToTrack(trackId, clip),
     moveClip: (clipId, newTrackId, newStart) => api.MoveClip(clipId, newTrackId, newStart),

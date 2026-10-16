@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
 import { X, Film, FolderOpen, Clock, FolderInput } from "lucide-react";
-import { useEditorStore } from "../../stores/editorStore";
+import { useEditorStore, confirmDiscardUnsaved } from "../../stores/editorStore";
 import { createBackend } from "../../services";
 import type { RecentEntry } from "../../types/project";
+import { Modal } from "../../components/Modal";
 
 interface NewProjectModalProps {
   onClose: () => void;
@@ -57,12 +58,13 @@ export function NewProjectModal({ onClose }: NewProjectModalProps) {
       const backend = await createBackend();
       const dir = await backend.openDirectoryDialog();
       if (dir) setLocation(dir);
-    } catch (e: any) {
-      useEditorStore.getState().setError(e.message || String(e));
+    } catch (e) {
+      useEditorStore.getState().setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
 
   const handleCreate = async () => {
+    if (!confirmDiscardUnsaved()) return;
     const preset = PRESETS[presetIdx];
     // Only pass a custom parentDir when it differs from the app's
     // configured default - avoids sending a redundant override for the
@@ -73,16 +75,14 @@ export function NewProjectModal({ onClose }: NewProjectModalProps) {
   };
 
   const handleOpenRecent = async (dir: string) => {
+    if (!confirmDiscardUnsaved()) return;
     await openProjectFrom(dir);
     onClose();
   };
 
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60" onMouseDown={onClose}>
-      <div
-        className="w-[760px] max-h-[80vh] rounded-lg bg-surface-2 border border-border-strong shadow-2xl flex overflow-hidden"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose}>
+      <div className="w-[760px] max-h-[80vh] rounded-lg bg-surface-2 border border-border-strong shadow-2xl flex overflow-hidden">
         {/* Left: new project form */}
         <div className="w-[380px] shrink-0 p-5 border-r border-border-subtle overflow-y-auto">
           <div className="flex items-center justify-between mb-4">
@@ -200,6 +200,6 @@ export function NewProjectModal({ onClose }: NewProjectModalProps) {
           </div>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

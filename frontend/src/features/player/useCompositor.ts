@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback } from "react";
-import type { Project, Clip, Track, TextClip, Effect, InterpolationType, TransitionType } from "../../types/project";
+import type { Project, Clip, MediaAsset, TextClip, Effect, InterpolationType, TransitionType } from "../../types/project";
 import { resolveMediaUrl } from "../../utils/mediaUrl";
+import { useEditorStore } from "../../stores/editorStore";
 
 /**
  * useCompositor drives a <canvas> preview by:
@@ -29,11 +30,6 @@ import { resolveMediaUrl } from "../../utils/mediaUrl";
  */
 
 const SEEK_TOLERANCE_SEC = 0.08;
-
-interface VideoElementEntry {
-  el: HTMLVideoElement;
-  assetId: string;
-}
 
 /**
  * Applies an easing curve to a normalized [0,1] progress value, used by
@@ -238,7 +234,7 @@ export function drawTransitionPair(
 /**
  * Computes the "contain" rectangle for a source of the given aspect ratio
  * fitted inside the canvas while preserving aspect ratio (letterboxing --
- * object-fit: contain). Shared by drawContained and the transition
+ * object-fit: contain). Shared by the clip renderer and the transition
  * renderer so every place that places a media frame on the canvas agrees
  * exactly on the frame's bounds.
  */
@@ -262,368 +258,371 @@ export function containRect(
   return { x: (canvasWidth - dw) / 2, y: (canvasHeight - dh) / 2, dw, dh };
 }
 
+/** Everything the render loop needs, derived once per project change instead of every frame. */
+interface RenderPlan {
+  // Logical (project) frame size. All drawing happens in these units; the
+  // canvas buffer itself may be smaller (see renderFrame).
+  width: number;
+  height: number;
+  assetsById: Map<string, MediaAsset>;
+  // Visible video tracks, bottom-most first, each with its clips sorted by start time.
+  videoTracks: Clip[][];
+  // Visible text clips, in draw order.
+  textClips: TextClip[];
+  // Canvas filter string per clip id (see buildCanvasFilter), valid for filterScale.
+  filterByClip: Map<string, string>;
+  filterScale: number;
+}
+
+function buildRenderPlan(project: Project): RenderPlan {
+  const videoTracks = project.tracks
+    .filter((t) => t.type === "video" && !t.hidden)
+    .sort((a, b) => a.order - b.order)
+    .map((t) => {
+      return (t.clips ?? []).slice().sort((a, b) => a.timelineStartSec - b.timelineStartSec);
+    });
+  const textClips = project.tracks
+    .filter((t) => t.type === "text" && !t.hidden)
+    .sort((a, b) => a.order - b.order)
+    .flatMap((t) => t.textClips ?? []);
+  return {
+    width: project.canvasWidth,
+    height: project.canvasHeight,
+    assetsById: new Map(project.assets.map((a) => [a.id, a])),
+    videoTracks,
+    textClips,
+    filterByClip: new Map(),
+    filterScale: 1,
+  };
+}
+
+function findActiveClip(sortedClips: Clip[], atSec: number): Clip | null {
+  for (const clip of sortedClips) {
+    if (clip.timelineStartSec > atSec) break;
+    if (atSec < clip.timelineEndSec) return clip;
+  }
+  return null;
+}
+
+/**
+ * Brings one decoder element to the frame the timeline needs.
+ *
+ * Paused: seek only when the target actually changed - the old loop set
+ * currentTime on every animation frame even when nothing moved, keeping
+ * the decoder permanently busy re-seeking to the same frame.
+ * Playing: let the element play natively at the clip's speed and only
+ * correct real drift (e.g. after a scrub or clip boundary).
+ */
+function syncVideo(video: HTMLVideoElement, targetSec: number, speed: number, playing: boolean) {
+  if (video.readyState < 1) return; // no metadata yet - can't seek
+  const target = Math.max(0, targetSec);
+  const rate = Math.min(16, Math.max(0.0625, speed || 1));
+  if (video.playbackRate !== rate) video.playbackRate = rate;
+  const drift = Math.abs(video.currentTime - target);
+  if (playing) {
+    if (drift > SEEK_TOLERANCE_SEC && !video.seeking) video.currentTime = target;
+    if (video.paused) video.play().catch(() => {});
+  } else {
+    if (!video.paused) video.pause();
+    if (drift > 0.001) video.currentTime = target;
+  }
+}
+
+function releaseVideo(video: HTMLVideoElement) {
+  video.pause();
+  video.removeAttribute("src");
+  video.load(); // actually frees the decoder/buffer
+  video.remove();
+}
+
+/**
+ * useCompositor renders the timeline at the current playhead into the
+ * given canvas. It reads the playhead straight from the store (not via
+ * React props), so playback doesn't re-render the Player 60x/second, and
+ * when paused it only redraws when something actually changed (playhead
+ * moved, project edited, or a decoder finished loading/seeking).
+ */
 export function useCompositor(
-  project: Project | null,
   canvasRef: React.RefObject<HTMLCanvasElement | null>,
-  hiddenHostRef: React.RefObject<HTMLDivElement | null>,
-  playheadSec: number,
-  isPlaying: boolean
+  hiddenHostRef: React.RefObject<HTMLDivElement | null>
 ) {
-  const videoElementsRef = useRef<Map<string, VideoElementEntry>>(new Map());
-  const imageElementsRef = useRef<Map<string, HTMLImageElement>>(new Map());
-  const rafRef = useRef<number | null>(null);
-  // Refs mirroring the latest playheadSec / isPlaying so that drawFrame —
-  // which runs inside a requestAnimationFrame callback — always reads
-  // the *current* values instead of a stale closure capture. This is
-  // critical: during playback playheadSec changes every frame, and baking
-  // it into drawFrame's useCallback deps would recreate drawFrame (and
-  // thus tear down & rebuild the entire RAF loop) sixty times a second,
-  // which races against the playback clock and starves the canvas of
-  // frames (the preview stops updating while the timeline keeps advancing).
-  // The same "read latest via ref inside a stable callback" pattern is
-  // already used correctly by usePlaybackClock's tick function.
-  const playheadSecRef = useRef(playheadSec);
-  const isPlayingRef = useRef(isPlaying);
-  // Keep the refs in sync with the latest render values. Updating a ref is
-  // not allowed during render, so this happens inside an effect, which React
-  // runs synchronously before the browser paints / before the next animation
-  // frame. That ordering is what lets drawFrame read the freshest playhead and
-  // playing state from the refs without ever needing to be recreated.
-  useEffect(() => {
-    playheadSecRef.current = playheadSec;
-    isPlayingRef.current = isPlaying;
-  });
+  const project = useEditorStore((s) => s.project);
+  const isPlaying = useEditorStore((s) => s.isPlaying);
 
-  // --- Element pool management: create/destroy hidden <video>/<img>
-  // elements as assets are referenced by clips on the timeline. ---
-  useEffect(() => {
-    if (!project) return;
+  // Decoder pool keyed by `${assetId}#${slot}`. Slot 0 serves the common
+  // case; extra slots are created on demand when one asset is visible
+  // more than once in the same frame (a transition between two halves of
+  // a split clip, or the same video on two tracks) - sharing one element
+  // there made it seek back and forth between two times every frame.
+  const videosRef = useRef(new Map<string, HTMLVideoElement>());
+  const imagesRef = useRef(new Map<string, HTMLImageElement>());
+  const planRef = useRef<RenderPlan | null>(null);
+  const dirtyRef = useRef(true);
 
-    const neededAssetIds = new Set<string>();
+  const getVideo = useCallback(
+    (asset: MediaAsset, slot: number): HTMLVideoElement => {
+      const key = `${asset.id}#${slot}`;
+      const existing = videosRef.current.get(key);
+      if (existing) return existing;
+
+      const video = document.createElement("video");
+      video.muted = true; // visuals only; audio is played by useAudioSync
+      video.preload = "auto";
+      video.playsInline = true;
+      const markDirty = () => {
+        dirtyRef.current = true;
+      };
+      video.addEventListener("loadedmetadata", markDirty);
+      video.addEventListener("loadeddata", markDirty);
+      video.addEventListener("seeked", markDirty);
+      // Must be attached to the document: Chromium can leave a detached
+      // <video> stuck at readyState HAVE_METADATA forever.
+      hiddenHostRef.current?.appendChild(video);
+      videosRef.current.set(key, video);
+      resolveMediaUrl(asset.filePath)
+        .then((url) => {
+          video.src = url;
+        })
+        .catch((err) => console.error(`Failed to load video asset ${asset.fileName}:`, err));
+      return video;
+    },
+    [hiddenHostRef]
+  );
+
+  const getImage = useCallback(
+    (asset: MediaAsset): HTMLImageElement => {
+      const existing = imagesRef.current.get(asset.id);
+      if (existing) return existing;
+
+      const img = new Image();
+      img.addEventListener("load", () => {
+        dirtyRef.current = true;
+      });
+      hiddenHostRef.current?.appendChild(img);
+      imagesRef.current.set(asset.id, img);
+      resolveMediaUrl(asset.filePath)
+        .then((url) => {
+          img.src = url;
+        })
+        .catch((err) => console.error(`Failed to load image asset ${asset.fileName}:`, err));
+      return img;
+    },
+    [hiddenHostRef]
+  );
+
+  // Rebuild the render plan and pre-warm/destroy decoders as clips come
+  // and go, so a long session doesn't accumulate unused elements.
+  useEffect(() => {
+    const plan = project ? buildRenderPlan(project) : null;
+    planRef.current = plan;
+    dirtyRef.current = true;
+    if (!project || !plan) return;
+
+    const needed = new Set<string>();
     for (const track of project.tracks) {
       if (track.type !== "video") continue;
-      for (const clip of track.clips ?? []) neededAssetIds.add(clip.assetId);
+      for (const clip of track.clips ?? []) needed.add(clip.assetId);
     }
-
-    const assetsById = new Map(project.assets.map((a) => [a.id, a]));
-
-    // Create any missing elements.
-    for (const assetId of neededAssetIds) {
-      const asset = assetsById.get(assetId);
-      if (!asset) continue;
-
-      if (asset.mediaType === "video" && !videoElementsRef.current.has(assetId)) {
-        const video = document.createElement("video");
-        video.muted = true; // canvas compositor handles visuals only; audio is mixed/played separately (see useAudioSync)
-        video.preload = "auto";
-        video.playsInline = true;
-        // Crucial: the element must be attached to the document for the
-        // browser to reliably advance it past readyState
-        // HAVE_METADATA (1) to HAVE_ENOUGH_DATA (2+) - a video element
-        // created via document.createElement and never inserted into
-        // the DOM can get permanently stuck at readyState 1 in Chromium,
-        // even though decoding doesn't require the element to be
-        // visible (we keep it visually hidden via the host container's
-        // own styling, not via detachment).
-        hiddenHostRef.current?.appendChild(video);
-        videoElementsRef.current.set(assetId, { el: video, assetId });
-        // asset.filePath is a raw filesystem path from the real backend
-        // (not a browser-loadable URL) - resolve it before assigning src.
-        // Until this resolves the element just has no src, so the draw
-        // loop's videoWidth/videoHeight check below naturally skips
-        // drawing it (a legitimate loading state, not a bug).
-        resolveMediaUrl(asset.filePath)
-          .then((url) => {
-            video.src = url;
-          })
-          .catch((err) => {
-            console.error(`Failed to load video asset ${asset.fileName}:`, err);
-          });
-      }
-
-      if (asset.mediaType === "image" && !imageElementsRef.current.has(assetId)) {
-        const img = new Image();
-        hiddenHostRef.current?.appendChild(img);
-        imageElementsRef.current.set(assetId, img);
-        resolveMediaUrl(asset.filePath)
-          .then((url) => {
-            img.src = url;
-          })
-          .catch((err) => {
-            console.error(`Failed to load image asset ${asset.fileName}:`, err);
-          });
+    for (const assetId of needed) {
+      const asset = plan.assetsById.get(assetId);
+      if (asset?.mediaType === "video") getVideo(asset, 0);
+      else if (asset?.mediaType === "image") getImage(asset);
+    }
+    for (const [key, video] of videosRef.current) {
+      if (!needed.has(key.slice(0, key.lastIndexOf("#")))) {
+        releaseVideo(video);
+        videosRef.current.delete(key);
       }
     }
-
-    // Destroy elements for assets no longer referenced by any clip, so a
-    // long editing session doesn't accumulate unused decoders.
-    for (const [assetId, entry] of videoElementsRef.current) {
-      if (!neededAssetIds.has(assetId)) {
-        entry.el.pause();
-        entry.el.removeAttribute("src");
-        entry.el.remove();
-        videoElementsRef.current.delete(assetId);
+    for (const [assetId, img] of imagesRef.current) {
+      if (!needed.has(assetId)) {
+        img.remove();
+        imagesRef.current.delete(assetId);
       }
     }
-    for (const assetId of imageElementsRef.current.keys()) {
-      const img = imageElementsRef.current.get(assetId);
-      if (!neededAssetIds.has(assetId)) {
-        img?.remove();
-        imageElementsRef.current.delete(assetId);
-      }
-    }
-  }, [project, hiddenHostRef]);
+  }, [project, getVideo, getImage]);
 
-  const findActiveClip = useCallback((track: Track, atSec: number): Clip | null => {
-    for (const clip of track.clips ?? []) {
-      if (atSec >= clip.timelineStartSec && atSec < clip.timelineEndSec) return clip;
-    }
-    return null;
+  useEffect(() => {
+    dirtyRef.current = true;
+    if (!isPlaying) for (const video of videosRef.current.values()) video.pause();
+  }, [isPlaying]);
+
+  useEffect(
+    () =>
+      useEditorStore.subscribe((state, prev) => {
+        if (state.playheadSec !== prev.playheadSec) dirtyRef.current = true;
+      }),
+    []
+  );
+
+  // Release every decoder on unmount.
+  useEffect(() => {
+    const videos = videosRef.current;
+    const images = imagesRef.current;
+    return () => {
+      for (const video of videos.values()) releaseVideo(video);
+      for (const img of images.values()) img.remove();
+      videos.clear();
+      images.clear();
+    };
   }, []);
 
-  // --- Play/pause: drive every active video element's native playback
-  // (or paused) state so frames actually advance between our redraw calls.
-  // When transitioning to playing we also nudge each already-decoded video
-  // element to the current playhead *before* calling play(), so playback
-  // doesn't start from a stale currentTime (e.g. 0 on a fresh load, or a
-  // position left over from a previous clip) and the very first drawn frame
-  // is correct instead of a one-frame flash from the wrong position. ---
+  // --- The render loop. ---
   useEffect(() => {
-    if (!project) return;
+    let raf = 0;
+    let ctx: CanvasRenderingContext2D | null = null;
 
-    if (isPlaying) {
-      const assetsById = new Map(project.assets.map((a) => [a.id, a]));
-      for (const track of project.tracks) {
-        if (track.type !== "video" || track.hidden) continue;
-        const clip = findActiveClip(track, playheadSec);
-        if (!clip) continue;
-        const asset = assetsById.get(clip.assetId);
-        if (!asset || asset.mediaType !== "video") continue;
-        const entry = videoElementsRef.current.get(asset.id);
-        if (!entry) continue;
-        const sourceTime = clip.sourceInSec + (playheadSec - clip.timelineStartSec) * (clip.speed || 1);
-        if (entry.el.readyState >= 1 && Math.abs(entry.el.currentTime - sourceTime) > SEEK_TOLERANCE_SEC) {
-          entry.el.currentTime = sourceTime;
-        }
-      }
-      // Now start every video element playing natively. Those that are
-      // already at the right position will show their decoded frame
-      // immediately; the drawFrame loop below keeps them in sync.
-      for (const { el } of videoElementsRef.current.values()) {
-        el.play().catch(() => {
-          /* benign: browsers can reject play() if called before a user
-             gesture in some contexts; the compositor's drawFrame still
-             seeks and draws the correct frame on every tick. */
-        });
-      }
-    } else {
-      for (const { el } of videoElementsRef.current.values()) {
-        el.pause();
-      }
-    }
-  }, [isPlaying, project, playheadSec, findActiveClip]);
+    const frame = () => {
+      // Always reschedule first: a single bad frame (canvas not mounted
+      // yet, no project during a StrictMode remount) must never kill the loop.
+      raf = requestAnimationFrame(frame);
 
-  // --- The render loop itself. ---
-  // drawFrame is a *stable* callback (its deps do NOT include playheadSec
-  // or isPlaying -- those are read from refs below). This is essential:
-  // if playheadSec were a dependency, playback would recreate drawFrame on
-  // every frame, causing the RAF useEffect below to cancel & reschedule
-  // the animation loop 60x/second -- racing the playback clock and leaving
-  // the canvas starved of frames (nothing renders while the timeline
-  // keeps advancing). By reading the latest values via refs we keep the
-  // RAF loop running continuously at full browser refresh rate.
-  const drawFrame = useCallback(() => {
-    // Read latest values from refs -- updated on every React render --
-    // so the RAF callback always sees the current playhead/time without
-    // needing to be recreated.
-    const currentPlayhead = playheadSecRef.current;
-    const currentIsPlaying = isPlayingRef.current;
+      const canvas = canvasRef.current;
+      const plan = planRef.current;
+      if (!canvas || !plan) return;
+      const { playheadSec, isPlaying: playing } = useEditorStore.getState();
+      if (!playing && !dirtyRef.current) return;
+      dirtyRef.current = false;
 
-    const canvas = canvasRef.current;
-    if (!canvas || !project) {
-      // Don't just bail - reschedule. The canvas ref may not be attached
-      // yet on the very first frame (React hasn't committed the DOM
-      // node), and a project can briefly be null between unmount/remount
-      // in StrictMode. Returning without rescheduling here would
-      // permanently kill the loop on exactly the kind of transient
-      // single-frame failure that's common right at mount - which is
-      // exactly the bug this comment is here to prevent reintroducing.
-      rafRef.current = requestAnimationFrame(drawFrame);
-      return;
-    }
-    const ctx = canvas.getContext("2d");
-    if (!ctx) {
-      rafRef.current = requestAnimationFrame(drawFrame);
-      return;
-    }
-
-    ctx.fillStyle = "#000000";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    const assetsById = new Map(project.assets.map((a) => [a.id, a]));
-    const videoTracks = project.tracks.filter((t) => t.type === "video" && !t.hidden).sort((a, b) => a.order - b.order);
-
-    // Local per-frame helpers used to render clips and transitions. These
-    // are recreated on every requestAnimationFrame tick (they're cheap);
-    // crucially they read the *current* drawFrame values (playhead, playing
-    // state, refs), which is what keeps the whole loop correct and stable.
-    const seekVideoNear = (video: HTMLVideoElement, atSec: number) => {
-      if (atSec < 0) atSec = 0;
-      if (!currentIsPlaying || Math.abs(video.currentTime - atSec) > SEEK_TOLERANCE_SEC) {
-        if (video.readyState >= 1) {
-          video.currentTime = atSec;
-        }
-      }
+      if (!ctx || ctx.canvas !== canvas) ctx = canvas.getContext("2d", { alpha: false });
+      if (!ctx) return;
+      renderFrame(ctx, plan, playheadSec, playing, getVideo, getImage, videosRef.current);
     };
 
-    // Resolves a clip's media into a drawable atom at the given *source*
-    // time, seeking its underlying <video> element as needed. Returns null
-    // when the media isn't decodable yet (the transition just draws the side
-    // that is ready).
-    const mediaAtomFor = (clip: Clip, sourceTimeSec: number) => {
-      const asset = assetsById.get(clip.assetId);
-      if (!asset) return null;
-      if (asset.mediaType === "video") {
-        const video = videoElementsRef.current.get(asset.id)?.el;
-        if (!video) return null;
-        seekVideoNear(video, sourceTimeSec);
-        if (video.videoWidth > 0 && video.videoHeight > 0) {
-          return { source: video, srcW: video.videoWidth, srcH: video.videoHeight };
-        }
-        return null;
-      }
-      if (asset.mediaType === "image") {
-        const img = imageElementsRef.current.get(asset.id);
-        if (img && img.complete) {
-          return { source: img, srcW: img.naturalWidth, srcH: img.naturalHeight };
-        }
-        return null;
-      }
-      return null;
-    };
+    raf = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(raf);
+  }, [canvasRef, getVideo, getImage]);
 
-    // Draws the two sides of a transition at the current playhead: the
-    // outgoing clip continues forward at its real position while the
-    // incoming clip advances its head through the blend (so motion stays
-    // continuous across what would otherwise be a hard cut).
-    const drawPreviewTransition = (tr: ActiveTransition) => {
-      const progress = applyEasing(tr.progress, tr.easing);
-      const dur = (tr.out.transition && tr.out.transition.durationSec) || 1;
+  // Lets the Player force a redraw (e.g. after resizing the canvas buffer,
+  // which clears it).
+  return useCallback(() => {
+    dirtyRef.current = true;
+  }, []);
+}
 
-      const outAtom = mediaAtomFor(tr.out, sourceTimeForClip(tr.out, currentPlayhead));
-      const inSourceTime = tr.in.sourceInSec + tr.progress * dur * (tr.in.speed || 1);
-      const inAtom = mediaAtomFor(tr.in, inSourceTime);
+type MediaAtom = { source: CanvasImageSource; srcW: number; srcH: number };
 
+function renderFrame(
+  ctx: CanvasRenderingContext2D,
+  plan: RenderPlan,
+  t: number,
+  playing: boolean,
+  getVideo: (asset: MediaAsset, slot: number) => HTMLVideoElement,
+  getImage: (asset: MediaAsset) => HTMLImageElement,
+  allVideos: Map<string, HTMLVideoElement>
+) {
+  // The canvas buffer is sized to how big the preview is on screen
+  // (capped at project resolution - see Player.tsx), not always the full
+  // project size: a 4K project previewed in an 800px panel used to fill
+  // 8.3M pixels per frame. Everything below draws in project units and
+  // this transform maps them onto the buffer, so framing is identical.
+  const { width, height } = plan;
+  const scale = ctx.canvas.width / width;
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.filter = "none";
+  ctx.fillStyle = "#000000";
+  ctx.fillRect(0, 0, width, height);
+
+  // Canvas filters work in buffer pixels (they ignore the transform), so
+  // blur radii are scaled to match - cached until the scale changes.
+  if (plan.filterScale !== scale) {
+    plan.filterByClip.clear();
+    plan.filterScale = scale;
+  }
+  const filterFor = (clip: Clip): string => {
+    let f = plan.filterByClip.get(clip.id);
+    if (f === undefined) {
+      f = buildCanvasFilter(clip.effects ?? [], scale);
+      plan.filterByClip.set(clip.id, f);
+    }
+    return f;
+  };
+
+  const slotsUsed = new Map<string, number>();
+  const activeVideos = new Set<HTMLVideoElement>();
+
+  // Resolves a clip's media at a given *source* time into something
+  // drawable, syncing its decoder. Null while the media isn't decodable
+  // yet (a legitimate loading state - the frame just skips it).
+  const atomFor = (clip: Clip, sourceTimeSec: number): MediaAtom | null => {
+    const asset = plan.assetsById.get(clip.assetId);
+    if (!asset) return null;
+    if (asset.mediaType === "video") {
+      const slot = slotsUsed.get(asset.id) ?? 0;
+      slotsUsed.set(asset.id, slot + 1);
+      const video = getVideo(asset, slot);
+      activeVideos.add(video);
+      syncVideo(video, sourceTimeSec, clip.speed || 1, playing);
+      // videoWidth > 0 (not readyState >= 2) is the reliable "a frame is
+      // decoded" signal: readyState transiently drops to HAVE_METADATA
+      // right after every seek even though the frame is drawable.
+      return video.videoWidth > 0 && video.videoHeight > 0 ? { source: video, srcW: video.videoWidth, srcH: video.videoHeight } : null;
+    }
+    if (asset.mediaType === "image") {
+      const img = getImage(asset);
+      return img.complete && img.naturalWidth > 0 ? { source: img, srcW: img.naturalWidth, srcH: img.naturalHeight } : null;
+    }
+    return null;
+  };
+
+  for (const clips of plan.videoTracks) {
+    // Inside a transition window: composite outgoing + incoming instead
+    // of a hard cut. The outgoing clip continues at its real position
+    // while the incoming clip advances its head through the blend.
+    const tr = findActiveTransition(clips, t);
+    if (tr) {
+      const dur = tr.out.transition?.durationSec || 1;
+      const outAtom = atomFor(tr.out, sourceTimeForClip(tr.out, t));
+      const inAtom = atomFor(tr.in, tr.in.sourceInSec + tr.progress * dur * (tr.in.speed || 1));
       drawTransitionPair(
         ctx,
         {
-          source: outAtom ? outAtom.source : null,
-          srcW: outAtom ? outAtom.srcW : 0,
-          srcH: outAtom ? outAtom.srcH : 0,
-          filter: buildCanvasFilter(tr.out.effects ?? []),
+          source: outAtom?.source ?? null,
+          srcW: outAtom?.srcW ?? 0,
+          srcH: outAtom?.srcH ?? 0,
+          filter: filterFor(tr.out),
           baseAlpha: tr.out.opacity ?? 1,
         },
         {
-          source: inAtom ? inAtom.source : null,
-          srcW: inAtom ? inAtom.srcW : 0,
-          srcH: inAtom ? inAtom.srcH : 0,
-          filter: buildCanvasFilter(tr.in.effects ?? []),
+          source: inAtom?.source ?? null,
+          srcW: inAtom?.srcW ?? 0,
+          srcH: inAtom?.srcH ?? 0,
+          filter: filterFor(tr.in),
           baseAlpha: tr.in.opacity ?? 1,
         },
-        progress,
+        applyEasing(tr.progress, tr.easing),
         tr.type,
         tr.direction,
-        canvas.width,
-        canvas.height
+        width,
+        height
       );
-    };
-
-    for (const track of videoTracks) {
-      const sortedClips = (track.clips ?? []).slice().sort((a, b) => a.timelineStartSec - b.timelineStartSec);
-
-      // If the playhead is inside a transition window, composite the outgoing
-      // + incoming clips instead of drawing a straight hard-cut active clip.
-      const activeTransition = findActiveTransition(sortedClips, currentPlayhead);
-      if (activeTransition) {
-        drawPreviewTransition(activeTransition);
-        continue;
-      }
-
-      const clip = findActiveClip(track, currentPlayhead);
-      if (!clip) continue;
-
-      const asset = assetsById.get(clip.assetId);
-      if (!asset) continue;
-
-      const opacity = clip.opacity ?? 1;
-      ctx.globalAlpha = opacity;
-      ctx.filter = buildCanvasFilter(clip.effects ?? []);
-
-      if (asset.mediaType === "video") {
-        const entry = videoElementsRef.current.get(asset.id);
-        if (!entry) continue;
-        const video = entry.el;
-
-        const sourceTime = clip.sourceInSec + (currentPlayhead - clip.timelineStartSec) * (clip.speed || 1);
-
-        // Only force a seek when not currently playing, or when natural
-        // playback has drifted noticeably from where it should be (e.g.
-        // right after a scrub or a clip boundary jump). This keeps
-        // scrubbing precise while letting playback run smoothly off the
-        // video element's own clock rather than fighting it every frame.
-        if (!currentIsPlaying || Math.abs(video.currentTime - sourceTime) > SEEK_TOLERANCE_SEC) {
-          if (video.readyState >= 1) {
-            video.currentTime = sourceTime;
-          }
-        }
-
-        // Note on readyState: immediately after setting video.currentTime
-        // (the seek above), the browser can transiently drop readyState
-        // back down to HAVE_METADATA (1) while it buffers around the new
-        // position, even though the element already has a decodable
-        // frame available. Gating strictly on readyState >= 2
-        // (HAVE_CURRENT_DATA) caused the canvas to skip drawing on
-        // exactly the frames right after every seek - i.e. constantly,
-        // since scrubbing/seeking is the normal way the playhead moves
-        // when not playing. videoWidth becoming non-zero is a more
-        // reliable signal that there's an actual decoded frame to draw;
-        // canvas drawImage against a <video> with at least one decoded
-        // frame works correctly even at readyState 1.
-        if (video.videoWidth > 0 && video.videoHeight > 0) {
-          drawContained(ctx, video, video.videoWidth, video.videoHeight, canvas.width, canvas.height);
-        }
-      } else if (asset.mediaType === "image") {
-        const img = imageElementsRef.current.get(asset.id);
-        if (img && img.complete) {
-          drawContained(ctx, img, img.naturalWidth, img.naturalHeight, canvas.width, canvas.height);
-        }
-      }
-
-      ctx.globalAlpha = 1;
-      ctx.filter = "none";
+      continue;
     }
 
-    // Text layers - always drawn above every video track, matching the
-    // export pipeline's drawtext chain (see backend/export/builder.go),
-    // which always composites text as the last stage before the final
-    // format normalization.
-    const textTracks = project.tracks.filter((t) => t.type === "text" && !t.hidden).sort((a, b) => a.order - b.order);
-    for (const track of textTracks) {
-      for (const tc of track.textClips ?? []) {
-        if (currentPlayhead < tc.timelineStartSec || currentPlayhead >= tc.timelineEndSec) continue;
-        drawTextClip(ctx, tc, canvas.width, canvas.height);
-      }
-    }
+    const clip = findActiveClip(clips, t);
+    if (!clip) continue;
+    const atom = atomFor(clip, sourceTimeForClip(clip, t));
+    if (!atom) continue;
+    const rect = containRect(atom.srcW, atom.srcH, width, height);
+    ctx.save();
+    ctx.globalAlpha = clip.opacity ?? 1;
+    ctx.filter = filterFor(clip);
+    ctx.drawImage(atom.source, rect.x, rect.y, rect.dw, rect.dh);
+    ctx.restore();
+  }
 
-    rafRef.current = requestAnimationFrame(drawFrame);
-  }, [project, canvasRef, findActiveClip]);
+  // Text layers - always drawn above every video track, matching the
+  // export pipeline's drawtext chain (see backend/export/builder.go).
+  for (const tc of plan.textClips) {
+    if (t >= tc.timelineStartSec && t < tc.timelineEndSec) drawTextClip(ctx, tc, width, height);
+  }
 
-  useEffect(() => {
-    rafRef.current = requestAnimationFrame(drawFrame);
-    return () => {
-      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
-    };
-  }, [drawFrame]);
+  // Only clips under the playhead should be decoding - the old code
+  // started *every* pooled video playing whenever playback began.
+  for (const video of allVideos.values()) {
+    if (!activeVideos.has(video) && !video.paused) video.pause();
+  }
 }
 
 /**
@@ -641,7 +640,7 @@ export function useCompositor(
  * available, since "some directionally-correct feedback while dragging
  * the slider" is more useful here than nothing at all.
  */
-function buildCanvasFilter(effects: Effect[]): string {
+function buildCanvasFilter(effects: Effect[], pixelScale = 1): string {
   const parts: string[] = [];
   for (const effect of effects) {
     if (!effect.enabled) continue;
@@ -658,7 +657,7 @@ function buildCanvasFilter(effects: Effect[]): string {
         break;
       case "blur": {
         const radius = effect.params?.radiusPx ?? 0;
-        if (radius > 0) parts.push(`blur(${radius}px)`);
+        if (radius > 0) parts.push(`blur(${radius * pixelScale}px)`);
         break;
       }
       case "sharpen":
@@ -675,41 +674,6 @@ function buildCanvasFilter(effects: Effect[]): string {
     }
   }
   return parts.length > 0 ? parts.join(" ") : "none";
-}
-
-/**
- * drawContained draws a source media element onto the canvas using
- * "object-fit: contain" semantics (preserve aspect ratio, letterbox if
- * needed) - this matches how the eventual export's `scale + pad` filter
- * chain treats mismatched-aspect-ratio source clips, so the preview and
- * the final render agree on framing.
- */
-function drawContained(
-  ctx: CanvasRenderingContext2D,
-  source: CanvasImageSource,
-  sourceWidth: number,
-  sourceHeight: number,
-  canvasWidth: number,
-  canvasHeight: number
-) {
-  if (!sourceWidth || !sourceHeight) return;
-
-  const sourceAspect = sourceWidth / sourceHeight;
-  const canvasAspect = canvasWidth / canvasHeight;
-
-  let drawWidth: number, drawHeight: number;
-  if (sourceAspect > canvasAspect) {
-    drawWidth = canvasWidth;
-    drawHeight = canvasWidth / sourceAspect;
-  } else {
-    drawHeight = canvasHeight;
-    drawWidth = canvasHeight * sourceAspect;
-  }
-
-  const x = (canvasWidth - drawWidth) / 2;
-  const y = (canvasHeight - drawHeight) / 2;
-
-  ctx.drawImage(source, x, y, drawWidth, drawHeight);
 }
 
 /**
@@ -763,20 +727,28 @@ function drawTextClip(ctx: CanvasRenderingContext2D, tc: TextClip, canvasWidth: 
   const y = (tc.positionYPercent / 100) * canvasHeight;
 
   if (tc.shadowEnabled) {
+    // Shadow offsets/blur are in buffer pixels (unaffected by the
+    // transform), so scale them to stay proportional at any preview size.
+    const px = ctx.getTransform().a;
     ctx.shadowColor = tc.shadowColor || "rgba(0,0,0,0.5)";
-    ctx.shadowOffsetX = 2;
-    ctx.shadowOffsetY = 2;
-    ctx.shadowBlur = 2;
+    ctx.shadowOffsetX = 2 * px;
+    ctx.shadowOffsetY = 2 * px;
+    ctx.shadowBlur = 2 * px;
   }
+
+  const lines = tc.content.split("\n");
+  const lineHeight = tc.fontSize * 1.2;
+  const firstY = y - ((lines.length - 1) * lineHeight) / 2;
 
   if (tc.outlineEnabled && tc.outlineWidth > 0) {
     ctx.lineWidth = tc.outlineWidth * 2; // canvas strokes centered on the path; double width to match drawtext's border appearing fully outside the glyph
     ctx.strokeStyle = tc.outlineColor || "#000000";
-    ctx.strokeText(tc.content, x, y);
+    ctx.lineJoin = "round";
+    lines.forEach((line, i) => ctx.strokeText(line, x, firstY + i * lineHeight));
   }
 
   ctx.fillStyle = tc.color || "#ffffff";
-  ctx.fillText(tc.content, x, y);
+  lines.forEach((line, i) => ctx.fillText(line, x, firstY + i * lineHeight));
 
   ctx.restore();
 }

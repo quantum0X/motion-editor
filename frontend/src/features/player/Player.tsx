@@ -6,19 +6,31 @@ import { useAudioSync } from "./useAudioSync";
 import { usePlaybackClock } from "./usePlaybackClock";
 import { formatTimecode } from "../../utils/time";
 
+/**
+ * The only part of the player that re-renders as the playhead moves -
+ * the canvas, compositor and transport buttons don't depend on it.
+ */
+function TimecodeDisplay({ fps, duration }: { fps: number; duration: number }) {
+  const playheadSec = useEditorStore((s) => s.playheadSec);
+  return (
+    <div className="flex items-baseline gap-1.5 ml-1 font-mono-tabular text-sm tabular-nums">
+      <span className="text-text-primary">{formatTimecode(playheadSec, fps)}</span>
+      <span className="text-text-tertiary">/ {formatTimecode(duration, fps)}</span>
+    </div>
+  );
+}
+
 export function Player() {
   const project = useEditorStore((s) => s.project);
-  const playheadSec = useEditorStore((s) => s.playheadSec);
   const isPlaying = useEditorStore((s) => s.isPlaying);
-  const setPlayhead = useEditorStore((s) => s.setPlayhead);
-  const setIsPlaying = useEditorStore((s) => s.setIsPlaying);
+  const togglePlay = useEditorStore((s) => s.togglePlay);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const hiddenHostRef = useRef<HTMLDivElement>(null);
 
-  useCompositor(project, canvasRef, hiddenHostRef, playheadSec, isPlaying);
-  useAudioSync(project, playheadSec, isPlaying);
+  const requestRedraw = useCompositor(canvasRef, hiddenHostRef);
+  useAudioSync();
   usePlaybackClock();
 
   const canvasWidth = project?.canvasWidth ?? 1920;
@@ -26,59 +38,46 @@ export function Player() {
   const fps = project?.fps ?? 30;
   const duration = timelineDurationSec(project);
 
-  // Keep the canvas's actual pixel buffer at the project's real
-  // resolution (so export-quality framing matches preview exactly),
-  // while CSS scales it down to fit the available panel space.
+  // Size the canvas buffer to its on-screen size (in device pixels),
+  // capped at the project resolution. The compositor draws in project
+  // coordinates through a scale transform, so framing matches export
+  // exactly while a 4K project in a small panel no longer pays for
+  // millions of off-screen pixels every frame. Grows again in fullscreen.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    canvas.width = canvasWidth;
-    canvas.height = canvasHeight;
-  }, [canvasWidth, canvasHeight]);
-
-  const togglePlay = useCallback(() => {
-    if (!project) return;
-    if (playheadSec >= duration && duration > 0) {
-      setPlayhead(0);
-    }
-    setIsPlaying(!isPlaying);
-  }, [project, isPlaying, playheadSec, duration, setIsPlaying, setPlayhead]);
+    const fit = () => {
+      const cssWidth = canvas.getBoundingClientRect().width;
+      if (cssWidth <= 0) return;
+      const scale = Math.min(1, (cssWidth * (window.devicePixelRatio || 1)) / canvasWidth);
+      const w = Math.max(1, Math.round(canvasWidth * scale));
+      const h = Math.max(1, Math.round(canvasHeight * scale));
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+        requestRedraw(); // resizing the buffer clears it
+      }
+    };
+    fit();
+    const observer = new ResizeObserver(fit);
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, [canvasWidth, canvasHeight, requestRedraw]);
 
   const stepFrame = useCallback(
     (direction: 1 | -1) => {
+      const { setIsPlaying, setPlayhead, playheadSec } = useEditorStore.getState();
       setIsPlaying(false);
       setPlayhead(playheadSec + direction / fps);
     },
-    [playheadSec, fps, setIsPlaying, setPlayhead]
+    [fps]
   );
-
-  // Keyboard shortcuts: Space = play/pause. Scoped to this component via
-  // a window listener guarded by checking the active element isn't a
-  // text input, so typing a project name elsewhere doesn't accidentally
-  // toggle playback.
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement;
-      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
-
-      if (e.code === "Space") {
-        e.preventDefault();
-        togglePlay();
-      } else if (e.code === "ArrowLeft") {
-        e.preventDefault();
-        stepFrame(-1);
-      } else if (e.code === "ArrowRight") {
-        e.preventDefault();
-        stepFrame(1);
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [togglePlay, stepFrame]);
 
   const handleFullscreen = useCallback(() => {
     containerRef.current?.requestFullscreen?.();
   }, []);
+
+  const isEmpty = !!project && duration === 0;
 
   return (
     <div className="flex flex-col h-full bg-surface-1">
@@ -86,57 +85,72 @@ export function Player() {
           from. Positioned off-screen rather than display:none - some
           browsers deprioritize or stall decoding for display:none media
           elements the same way they do for fully detached ones. */}
-      <div ref={hiddenHostRef} style={{ position: "absolute", width: 1, height: 1, overflow: "hidden", top: -9999, left: -9999 }} />
+      <div ref={hiddenHostRef} aria-hidden style={{ position: "absolute", width: 1, height: 1, overflow: "hidden", top: -9999, left: -9999 }} />
 
-      <div ref={containerRef} className="flex-1 flex items-center justify-center bg-surface-0 min-h-0 p-3">
+      <div ref={containerRef} className="flex-1 flex items-center justify-center bg-surface-0 min-h-0 p-3" onDoubleClick={handleFullscreen}>
         <div
-          className="relative shadow-2xl"
+          className="relative shadow-2xl ring-1 ring-border-subtle"
           style={{ aspectRatio: `${canvasWidth} / ${canvasHeight}`, maxHeight: "100%", maxWidth: "100%" }}
         >
-          <canvas ref={canvasRef} className="w-full h-full block bg-black" style={{ aspectRatio: `${canvasWidth} / ${canvasHeight}` }} />
-          {!project && (
-            <div className="absolute inset-0 flex items-center justify-center text-text-tertiary text-sm">
-              No project open
+          <canvas ref={canvasRef} className="w-full h-full block bg-black" />
+          {(!project || isEmpty) && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-center text-text-tertiary text-sm pointer-events-none px-4">
+              {project ? (
+                <>
+                  <span className="text-text-secondary">Your timeline is empty</span>
+                  <span className="text-xs">Drag media onto a track, or double-click it in the library</span>
+                </>
+              ) : (
+                "No project open"
+              )}
             </div>
           )}
         </div>
       </div>
 
       {/* Transport bar */}
-      <div className="flex items-center gap-3 px-4 py-2.5 border-t border-border-subtle bg-surface-1 shrink-0">
+      <div className="flex items-center gap-3 px-4 py-2 border-t border-border-subtle bg-surface-1 shrink-0">
         <button
           onClick={() => stepFrame(-1)}
-          className="text-text-secondary hover:text-text-primary transition-colors"
+          disabled={!project}
+          className="p-1 rounded text-text-secondary hover:text-text-primary hover:bg-surface-3 disabled:opacity-40 transition-colors"
           title="Previous frame (←)"
+          aria-label="Previous frame"
         >
           <SkipBack size={16} />
         </button>
         <button
           onClick={togglePlay}
-          className="w-8 h-8 flex items-center justify-center rounded-full bg-accent hover:bg-accent-dim transition-colors text-white"
-          title="Play/Pause (Space)"
+          disabled={!project}
+          className="w-8 h-8 flex items-center justify-center rounded-full bg-accent hover:bg-accent-dim disabled:opacity-40 transition-colors text-white"
+          title={isPlaying ? "Pause (Space)" : "Play (Space)"}
+          aria-label={isPlaying ? "Pause" : "Play"}
         >
-          {isPlaying ? <Pause size={15} /> : <Play size={15} />}
+          {isPlaying ? <Pause size={15} /> : <Play size={15} className="translate-x-px" />}
         </button>
         <button
           onClick={() => stepFrame(1)}
-          className="text-text-secondary hover:text-text-primary transition-colors"
+          disabled={!project}
+          className="p-1 rounded text-text-secondary hover:text-text-primary hover:bg-surface-3 disabled:opacity-40 transition-colors"
           title="Next frame (→)"
+          aria-label="Next frame"
         >
           <SkipForward size={16} />
         </button>
 
-        <div className="font-mono-tabular text-sm text-text-primary tabular-nums ml-1">
-          {formatTimecode(playheadSec, fps)}
-        </div>
-        <div className="font-mono-tabular text-sm text-text-tertiary tabular-nums">/ {formatTimecode(duration, fps)}</div>
+        <TimecodeDisplay fps={fps} duration={duration} />
 
         <div className="flex-1" />
 
         <div className="text-xs text-text-tertiary font-mono-tabular">
           {canvasWidth}×{canvasHeight} · {fps}fps
         </div>
-        <button onClick={handleFullscreen} className="text-text-secondary hover:text-text-primary transition-colors" title="Fullscreen">
+        <button
+          onClick={handleFullscreen}
+          className="p-1 rounded text-text-secondary hover:text-text-primary hover:bg-surface-3 transition-colors"
+          title="Fullscreen (double-click preview)"
+          aria-label="Fullscreen"
+        >
           <Maximize2 size={14} />
         </button>
       </div>

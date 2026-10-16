@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
-import type { Project, Clip } from "../../types/project";
+import type { Clip } from "../../types/project";
+import { useEditorStore } from "../../stores/editorStore";
 import { resolveMediaUrl } from "../../utils/mediaUrl";
 
 /**
@@ -10,8 +11,12 @@ import { resolveMediaUrl } from "../../utils/mediaUrl";
  * streams. This hook owns one <audio>/<video> element per audio-bearing
  * asset purely for sound, independent of whatever the compositor is
  * doing visually with its own copies.
+ *
+ * Playhead changes are picked up through a direct store subscription
+ * rather than props, so keeping audio in sync never re-renders React.
  */
-export function useAudioSync(project: Project | null, playheadSec: number, isPlaying: boolean) {
+export function useAudioSync() {
+  const project = useEditorStore((s) => s.project);
   const audioElementsRef = useRef<Map<string, HTMLMediaElement>>(new Map());
 
   useEffect(() => {
@@ -49,43 +54,62 @@ export function useAudioSync(project: Project | null, playheadSec: number, isPla
     for (const [assetId, el] of audioElementsRef.current) {
       if (!neededAssetIds.has(assetId)) {
         el.pause();
+        el.removeAttribute("src");
+        el.load();
         audioElementsRef.current.delete(assetId);
       }
     }
   }, [project]);
 
   useEffect(() => {
-    if (!project) return;
+    const sync = () => {
+      const { project, playheadSec, isPlaying } = useEditorStore.getState();
+      if (!project) return;
 
-    const activeClipsByAsset = new Map<string, Clip>();
-    for (const track of project.tracks) {
-      if (track.muted) continue;
-      for (const clip of track.clips ?? []) {
-        if (clip.muted) continue;
-        if (playheadSec >= clip.timelineStartSec && playheadSec < clip.timelineEndSec) {
-          activeClipsByAsset.set(clip.assetId, clip);
+      const activeClipsByAsset = new Map<string, Clip>();
+      for (const track of project.tracks) {
+        if (track.muted) continue;
+        for (const clip of track.clips ?? []) {
+          if (clip.muted) continue;
+          if (playheadSec >= clip.timelineStartSec && playheadSec < clip.timelineEndSec) {
+            activeClipsByAsset.set(clip.assetId, clip);
+          }
         }
       }
-    }
 
-    for (const [assetId, el] of audioElementsRef.current) {
-      const activeClip = activeClipsByAsset.get(assetId);
+      for (const [assetId, el] of audioElementsRef.current) {
+        const activeClip = activeClipsByAsset.get(assetId);
 
-      if (!activeClip) {
-        el.pause();
-        continue;
+        if (!activeClip) {
+          if (!el.paused) el.pause();
+          continue;
+        }
+
+        el.volume = Math.min(1, Math.max(0, activeClip.volume ?? 1));
+        // Match the clip's speed, or a 2x clip's audio drifts behind and
+        // gets re-seeked (audible stutter) every quarter second.
+        const rate = Math.min(16, Math.max(0.0625, activeClip.speed || 1));
+        if (el.playbackRate !== rate) el.playbackRate = rate;
+        const sourceTime = activeClip.sourceInSec + (playheadSec - activeClip.timelineStartSec) * (activeClip.speed || 1);
+
+        if (!isPlaying) {
+          if (!el.paused) el.pause();
+          if (Math.abs(el.currentTime - sourceTime) > 0.08) el.currentTime = sourceTime;
+        } else {
+          if (Math.abs(el.currentTime - sourceTime) > 0.25 && !el.seeking) el.currentTime = sourceTime;
+          if (el.paused) el.play().catch(() => {});
+        }
       }
+    };
 
-      el.volume = Math.min(1, Math.max(0, activeClip.volume ?? 1));
-      const sourceTime = activeClip.sourceInSec + (playheadSec - activeClip.timelineStartSec) * (activeClip.speed || 1);
-
-      if (!isPlaying) {
-        el.pause();
-        if (Math.abs(el.currentTime - sourceTime) > 0.08) el.currentTime = sourceTime;
-      } else {
-        if (Math.abs(el.currentTime - sourceTime) > 0.25) el.currentTime = sourceTime;
-        el.play().catch(() => {});
-      }
-    }
-  }, [project, playheadSec, isPlaying]);
+    sync();
+    const unsubscribe = useEditorStore.subscribe((state, prev) => {
+      if (state.playheadSec !== prev.playheadSec || state.isPlaying !== prev.isPlaying || state.project !== prev.project) sync();
+    });
+    const elements = audioElementsRef.current;
+    return () => {
+      unsubscribe();
+      for (const el of elements.values()) el.pause();
+    };
+  }, []);
 }
